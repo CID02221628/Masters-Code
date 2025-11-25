@@ -101,7 +101,6 @@ def _dbg_stats(name, arr, units="", expected_min=None, expected_max=None):
                   f"{bad_low} below {expected_min} {units}, "
                   f"{bad_high} above {expected_max} {units}")
 
-
 def _clean_omni_array(arr, physical_max, name, units):
     """
     Mask OMNI sentinel / impossible values.
@@ -111,7 +110,10 @@ def _clean_omni_array(arr, physical_max, name, units):
         (~np.isfinite(arr)) |
         (np.abs(arr) >= 1e29) |
         (arr == 99999) |
-        (arr == 9999)
+        (arr == 9999) |
+        (arr > 999) |              # ← KEY FIX: catches 999.99 sentinels
+        (arr == -999) |
+        (arr < 0)                  # ← NEW: negative density impossible
     )
     mask_big = np.abs(arr) > physical_max
     bad = mask_sent | mask_big
@@ -123,7 +125,6 @@ def _clean_omni_array(arr, physical_max, name, units):
     cleaned = arr.copy()
     cleaned[bad] = np.nan
     return cleaned
-
 
 # ------------------------------ SunPy import ------------------------------ #
 
