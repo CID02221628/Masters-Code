@@ -111,9 +111,10 @@ def _clean_omni_array(arr, physical_max, name, units):
         (np.abs(arr) >= 1e29) |
         (arr == 99999) |
         (arr == 9999) |
-        (arr > 999) |              # ← KEY FIX: catches 999.99 sentinels
+        (arr == 9999999) |       # ← ADD THIS for temperature sentinel
+        (arr > 999) |
         (arr == -999) |
-        (arr < 0)                  # ← NEW: negative density impossible
+        (arr < 0)
     )
     mask_big = np.abs(arr) > physical_max
     bad = mask_sent | mask_big
@@ -531,10 +532,14 @@ class L1DataLoader:
             # T
             if all_T:
                 T_combined = np.hstack(all_T).astype(float)
-                T_clean = _clean_omni_array(T_combined, 1e4, "L1 T", "eV")
-                result["T"] = T_clean
-                _dbg_stats("L1 T (clean)", T_clean, "eV",
-                           expected_min=0, expected_max=2000)
+                T_clean_K = _clean_omni_array(T_combined, 1e7, "L1 T", "K") 
+                
+                # Convert Kelvin → eV
+                T_clean_eV = T_clean_K / 11604.5
+                
+                result["T"] = T_clean_eV
+                _dbg_stats("L1 T (clean)", T_clean_eV, "eV",
+                        expected_min=0, expected_max=200)
 
             return result if len(result) > 1 else None
 
