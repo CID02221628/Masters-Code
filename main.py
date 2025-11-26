@@ -15,7 +15,6 @@ import pyspedas
 import cdflib
 from scipy.interpolate import interp1d
 from tqdm import tqdm
-from pytplot import get_data, tplot_names
 
 warnings.filterwarnings("ignore")
 
@@ -100,32 +99,6 @@ def _dbg_stats(name, arr, units="", expected_min=None, expected_max=None):
             print(f"[WARN] {name}: out-of-range => "
                   f"{bad_low} below {expected_min} {units}, "
                   f"{bad_high} above {expected_max} {units}")
-
-def _clean_omni_array(arr, physical_max, name, units):
-    """
-    Mask OMNI sentinel / impossible values.
-    """
-    arr = np.asarray(arr, dtype=float)
-    mask_sent = (
-        (~np.isfinite(arr)) |
-        (np.abs(arr) >= 1e29) |
-        (arr == 99999) |
-        (arr == 9999) |
-        (arr == 9999999) |       # ← ADD THIS for temperature sentinel
-        (arr > 999) |
-        (arr == -999) |
-        (arr < 0)
-    )
-    mask_big = np.abs(arr) > physical_max
-    bad = mask_sent | mask_big
-
-    if np.any(bad):
-        print(f"[WARN] {name}: masking {int(np.sum(bad))} bad points "
-              f"(sentinels or |x|>{physical_max} {units})")
-
-    cleaned = arr.copy()
-    cleaned[bad] = np.nan
-    return cleaned
 
 # ------------------------------ SunPy import ------------------------------ #
 
@@ -323,6 +296,7 @@ class SpacecraftData:
 
 
 class SunEarthLineAnalyzer:
+    
     @staticmethod
     def earth_position_at_time(time_dt, epoch_dt):
         days  = (time_dt - epoch_dt).total_seconds() / 86400
@@ -393,18 +367,19 @@ class CrossoverFinder:
 # ------------------------- L1 OMNI loader + ballistic -------------------- #
 
 class L1DataLoader:
+    
     @staticmethod
     def load_omni_data(t0_dt, t1_dt):
         """
-        Load OMNI high-res OMNI2 data and clean obvious sentinel/outlier values.
+        Load OMNI high-res OMNI2 data with inline cleaning per variable.
         """
         try:
             trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                      t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+                    t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
             files = pyspedas.omni.data(trange=trange,
-                                       level='hro',
-                                       time_clip=True,
-                                       downloadonly=True)
+                                    level='hro',
+                                    time_clip=True,
+                                    downloadonly=True)
             if not files:
                 return None
 
@@ -499,46 +474,120 @@ class L1DataLoader:
             time_arr = ensure_datetime_array(all_times)
             result = {"time": time_arr}
 
-            # B
+            # =====================================================================
+            # B-FIELD CLEANING (inline)
+            # =====================================================================
             if all_B:
-                B_combined = np.vstack(all_B)
-                B_clean = _clean_omni_array(B_combined, 200.0, "L1 B_gse", "nT")
-                result["B_gse"] = B_clean
-                if B_clean.ndim == 1 or B_clean.shape[1] == 1:
-                    _dbg_stats("L1 B (clean)", B_clean, "nT",
-                               expected_min=-100, expected_max=100)
+                B_combined = np.vstack(all_B).astype(float)
+                
+                # Mask B-field sentinels and bad values
+                mask_B = (
+                    (~np.isfinite(B_combined)) |
+                    (np.abs(B_combined) >= 1e29) |
+                    (B_combined == 99999) |
+                    (B_combined == 9999) |
+                    (np.abs(B_combined) > 200.0)  # Physical limit
+                )
+                
+                n_bad_B = np.sum(np.any(mask_B, axis=1))
+                if n_bad_B > 0:
+                    print(f"[WARN] L1 B_gse: masking {n_bad_B} bad points")
+                
+                B_combined[mask_B] = np.nan
+                result["B_gse"] = B_combined
+                
+                if B_combined.ndim == 1 or B_combined.shape[1] == 1:
+                    _dbg_stats("L1 B (clean)", B_combined, "nT",
+                            expected_min=-100, expected_max=100)
                 else:
-                    Bmag_clean = np.linalg.norm(B_clean, axis=1)
+                    Bmag_clean = np.linalg.norm(B_combined, axis=1)
                     _dbg_stats("L1 |B| (clean)", Bmag_clean, "nT",
-                               expected_min=0, expected_max=100)
+                            expected_min=0, expected_max=100)
 
-            # V
+            # =====================================================================
+            # VELOCITY CLEANING (inline)
+            # =====================================================================
             if all_V:
-                V_combined = np.vstack(all_V)
-                V_clean = _clean_omni_array(V_combined, 3000.0, "L1 V", "km/s")
-                result["V"] = V_clean
-                Vmag_clean = np.linalg.norm(V_clean, axis=1) if V_clean.ndim > 1 else V_clean
+                V_combined = np.vstack(all_V).astype(float)
+                
+                # Mask velocity sentinels and bad values
+                mask_V = (
+                    (~np.isfinite(V_combined)) |
+                    (np.abs(V_combined) >= 1e29) |
+                    (V_combined == 9999) |
+                    (V_combined == 99999) |
+                    (np.abs(V_combined) > 3000.0) |  # Physical limit
+                    (V_combined < 0)
+                )
+                
+                n_bad_V = np.sum(np.any(mask_V, axis=1))
+                if n_bad_V > 0:
+                    print(f"[WARN] L1 V: masking {n_bad_V} bad points")
+                
+                V_combined[mask_V] = np.nan
+                result["V"] = V_combined
+                
+                Vmag_clean = np.linalg.norm(V_combined, axis=1) if V_combined.ndim > 1 else V_combined
                 _dbg_stats("L1 V (clean)", Vmag_clean, "km/s",
-                           expected_min=0, expected_max=2000)
+                        expected_min=0, expected_max=2000)
 
-            # n
+            # =====================================================================
+            # DENSITY CLEANING (inline)
+            # =====================================================================
             if all_n:
                 n_combined = np.hstack(all_n).astype(float)
-                n_clean = _clean_omni_array(n_combined, 1000.0, "L1 n", "cm^-3")
-                result["n"] = n_clean
-                _dbg_stats("L1 n (clean)", n_clean, "cm^-3",
-                           expected_min=0, expected_max=100)
+                
+                # Mask density sentinels and bad values
+                mask_n = (
+                    (~np.isfinite(n_combined)) |
+                    (np.abs(n_combined) >= 1e29) |
+                    (n_combined >= 999.0) |
+                    (n_combined < 0)
+                )
+                
+                n_bad_n = np.sum(mask_n)
+                if n_bad_n > 0:
+                    print(f"[WARN] L1 n: masking {n_bad_n} bad points")
+                
+                n_combined[mask_n] = np.nan
+                result["n"] = n_combined
+                
+                _dbg_stats("L1 n (clean)", n_combined, "cm^-3",
+                        expected_min=0, expected_max=100)
 
-            # T
+            # =====================================================================
+            # TEMPERATURE CLEANING (inline) + KELVIN → eV CONVERSION
+            # =====================================================================
             if all_T:
                 T_combined = np.hstack(all_T).astype(float)
-                T_clean_K = _clean_omni_array(T_combined, 1e7, "L1 T", "K") 
+                
+                # OMNI stores temperature in KELVIN
+                # Sentinel: 9,999,999 K
+                # Valid range: ~5,000 - 2,000,000 K (0.4 - 200 eV)
+                
+                # Mask temperature sentinels (in Kelvin)
+                mask_T = (
+                    (~np.isfinite(T_combined)) |
+                    (np.abs(T_combined) >= 1e29) |
+                    (T_combined == 9999999) |      # Main sentinel
+                    (T_combined > 1e7) |           # Above physical limit
+                    (T_combined < 0)               # Negative impossible
+                )
+                
+                n_bad_T = np.sum(mask_T)
+                if n_bad_T > 0:
+                    print(f"[WARN] L1 T: masking {n_bad_T} bad points (in Kelvin)")
+                
+                T_combined[mask_T] = np.nan
                 
                 # Convert Kelvin → eV
-                T_clean_eV = T_clean_K / 11604.5
+                # 1 eV = 11,604.5 K
+                # So T[eV] = T[K] / 11,604.5
+                T_eV = T_combined / 11604.5
                 
-                result["T"] = T_clean_eV
-                _dbg_stats("L1 T (clean)", T_clean_eV, "eV",
+                result["T"] = T_eV
+                
+                _dbg_stats("L1 T (clean)", T_eV, "eV",
                         expected_min=0, expected_max=200)
 
             return result if len(result) > 1 else None
@@ -546,7 +595,7 @@ class L1DataLoader:
         except Exception as e:
             print(f"    OMNI error: {e}")
             return None
-
+    
     @staticmethod
     def get_l1_position(time_dt, epoch_date):
         earth_pos = SunEarthLineAnalyzer.earth_position_at_time(time_dt, epoch_date)
@@ -556,6 +605,7 @@ class L1DataLoader:
 
 
 class BallisticPropagation:
+    
     @staticmethod
     def calculate_propagation_delay(sc_pos, l1_pos, v_sw):
         delta_r = l1_pos - sc_pos
@@ -940,14 +990,25 @@ class SoloDataLoader:
         
     @staticmethod
     def load_kyoto_dst(t0_dt, t1_dt):
-        """Dst via OMNI high-res."""
+        """
+        Load Dst index from OMNI2 hourly data.
+        
+        CRITICAL: Dst is in hourly files (datatype='1hour'), NOT in HRO!
+        Files contain ~6 months of data, so we time-clip after loading.
+        """
         try:
-            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                      t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
-            files = pyspedas.omni.data(trange=trange,
-                                       level='hro',
-                                       time_clip=True,
-                                       downloadonly=True)
+            # Simple date format (no time component) for hourly data
+            trange = [t0_dt.strftime("%Y-%m-%d"),
+                    t1_dt.strftime("%Y-%m-%d")]
+            
+            # Use hourly data, NOT HRO
+            files = pyspedas.omni.data(
+                trange=trange,
+                datatype='1hour',  # ← FIX: hourly data, not 'hro'
+                time_clip=True,
+                downloadonly=True
+            )
+            
             if not files:
                 return None
 
@@ -960,41 +1021,82 @@ class SoloDataLoader:
                     continue
                 try:
                     cdf_info = cdf.cdf_info()
-                    vars_list = cdf_info.zVariables
-                    dst_var = next((v for v in vars_list
-                                    if 'DST' in v or 'Dst' in v or 'dst' in v), None)
+                    
+                    # FIX: Check BOTH zVariables and rVariables (Dst is in rVariables)
+                    vars_list = cdf_info.zVariables + cdf_info.rVariables
+                    
+                    # Try multiple possible names (DST is most common)
+                    dst_var = None
+                    for candidate in ['DST', 'Dst', 'dst', 'SYM_H']:
+                        if candidate in vars_list:
+                            dst_var = candidate
+                            break
+                    
                     if dst_var and 'Epoch' in vars_list:
                         epoch = cdf.varget('Epoch')
                         dst_data = cdf.varget(dst_var)
                         times_dt = cdflib.cdfepoch.to_datetime(epoch)
-                        all_times.extend(times_dt)
-                        all_dst.append(dst_data)
-                except Exception:
+                        
+                        # FIX: Time-clip to requested window
+                        # (files contain ~6 months, not just requested period)
+                        times_np = np.array(times_dt)
+                        mask_time = (times_np >= np.datetime64(t0_dt)) & (times_np <= np.datetime64(t1_dt))
+                        
+                        if np.any(mask_time):
+                            all_times.extend(times_np[mask_time])
+                            all_dst.append(dst_data[mask_time])
+                            
+                except Exception as e:
+                    print(f"    Err reading Dst from {os.path.basename(cdf_file)}: {e}")
                     continue
 
             if not all_dst:
                 return None
 
-            print("    ✓ Dst loaded")
+            times_array = ensure_datetime_array(all_times)
+            dst_array = np.hstack(all_dst).astype(float)
+            
+            # Clean sentinels
+            mask_bad = (
+                (~np.isfinite(dst_array)) |
+                (np.abs(dst_array) >= 9999)
+            )
+            dst_array[mask_bad] = np.nan
+
+            print(f"    ✓ Dst loaded: {np.sum(~np.isnan(dst_array))} valid points")
+            
             return {
-                "time": ensure_datetime_array(all_times),
-                "dst":  np.hstack(all_dst)
+                "time": times_array,
+                "dst":  dst_array
             }
 
         except Exception as e:
             print(f"    Dst error: {e}")
             return None
-
+    
     @staticmethod
     def load_kp_index(t0_dt, t1_dt):
-        """Kp via OMNI (if present)."""
+        """
+        Load Kp index from OMNI2 hourly data.
+        
+        CRITICAL: 
+        - Kp is in hourly files (datatype='1hour'), NOT in HRO
+        - Kp is stored as Kp × 10 (e.g., Kp=1.3 → stored as 13)
+        - Must divide by 10 to get actual Kp values
+        """
         try:
-            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                      t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
-            files = pyspedas.omni.data(trange=trange,
-                                       level='hro',
-                                       time_clip=True,
-                                       downloadonly=True)
+            # Simple date format for hourly data
+            trange = [t0_dt.strftime("%Y-%m-%d"),
+                    t1_dt.strftime("%Y-%m-%d")]
+            
+            # Use hourly data, NOT HRO
+            files = pyspedas.omni.data(
+                trange=trange,
+                datatype='1hour',  # ← FIX: hourly data, not 'hro'
+                time_clip=True,
+                downloadonly=True
+            )
+            
             if not files:
                 return None
 
@@ -1007,31 +1109,68 @@ class SoloDataLoader:
                     continue
                 try:
                     cdf_info = cdf.cdf_info()
-                    vars_list = cdf_info.zVariables
-                    kp_var = next((v for v in vars_list
-                                   if 'kp' in v.lower() or 'Kp' in v or 'KP' in v), None)
+                    
+                    # FIX: Check BOTH zVariables and rVariables (Kp is in rVariables)
+                    vars_list = cdf_info.zVariables + cdf_info.rVariables
+                    
+                    # Try multiple possible names
+                    kp_var = None
+                    for candidate in ['KP', 'Kp', 'kp', 'KP_INDEX', 'Kp_index']:
+                        if candidate in vars_list:
+                            kp_var = candidate
+                            break
+                    
                     if kp_var and 'Epoch' in vars_list:
                         epoch = cdf.varget('Epoch')
                         kp_data = cdf.varget(kp_var)
                         times_dt = cdflib.cdfepoch.to_datetime(epoch)
-                        all_times.extend(times_dt)
-                        all_kp.append(kp_data)
-                except Exception:
+                        
+                        # FIX: Time-clip to requested window
+                        times_np = np.array(times_dt)
+                        mask_time = (times_np >= np.datetime64(t0_dt)) & (times_np <= np.datetime64(t1_dt))
+                        
+                        if np.any(mask_time):
+                            all_times.extend(times_np[mask_time])
+                            all_kp.append(kp_data[mask_time])
+                            
+                except Exception as e:
+                    print(f"    Err reading Kp from {os.path.basename(cdf_file)}: {e}")
                     continue
 
             if not all_kp:
                 return None
 
-            print("    ✓ Kp loaded")
+            times_array = ensure_datetime_array(all_times)
+            kp_raw = np.hstack(all_kp).astype(float)
+            
+            # FIX: Clean sentinels and invalid values
+            # Kp is stored as Kp × 10, so valid range is 0-90
+            mask_bad = (
+                (~np.isfinite(kp_raw)) |
+                (kp_raw < 0) |
+                (kp_raw > 90) |
+                (np.abs(kp_raw - 999) < 1) |
+                (np.abs(kp_raw - 9999) < 1)
+            )
+            
+            kp_raw[mask_bad] = np.nan
+            
+            # FIX: Convert to actual Kp (divide by 10)
+            # OMNI stores Kp × 10 (e.g., Kp=1.3 → stored as 13)
+            kp_actual = kp_raw / 10.0
+            
+            n_valid = np.sum(~np.isnan(kp_actual))
+            print(f"    ✓ Kp loaded: {n_valid} valid points (range: {np.nanmin(kp_actual):.1f}-{np.nanmax(kp_actual):.1f})")
+
             return {
-                "time": ensure_datetime_array(all_times),
-                "kp":   np.hstack(all_kp).flatten()
+                "time": times_array,
+                "kp":   kp_actual  # ← Now in actual Kp units (0-9)
             }
 
         except Exception as e:
             print(f"    Kp error: {e}")
             return None
-
+        
     @staticmethod
     def interpolate_to_mag_time(mag_data, swa_moments):
         """Interpolate SWA moments to MAG times + debug ranges."""
@@ -1615,7 +1754,7 @@ class Plotter:
         return fig
 
     @staticmethod
-    def plot_solo_insitu_with_dst(event, preloaded, window_hours=INSITU_WINDOW_HR):
+    def plot_solo_insitu_with_dst(event, preloaded, spacecraft_ephemeris, epoch_date, window_hours=INSITU_WINDOW_HR):
         center = event.get("time")
         if not isinstance(center, datetime):
             print("[DBG] plot_solo_insitu_with_dst: event has no valid 'time'")
@@ -1641,7 +1780,6 @@ class Plotter:
             print(f"[DBG] plot_solo_insitu_with_dst: MAG missing for {center}")
             return None
 
-        # enforce datetimes
         T_mag_full = ensure_datetime_array(mag["time"])
         B_full     = mag["B"]
 
@@ -1665,18 +1803,19 @@ class Plotter:
         else:
             print(f"[DBG] plot_solo_insitu_with_dst: using {len(T_mag)} MAG points")
 
-        fig = plt.figure(figsize=(14, 22))
+        # CHANGED: 10 rows instead of 9
+        fig = plt.figure(figsize=(14, 24))
         from matplotlib.gridspec import GridSpec
-        gs = GridSpec(9, 1, figure=fig, hspace=0.3)
-        axes = [fig.add_subplot(gs[i, 0]) for i in range(9)]
+        gs = GridSpec(10, 1, figure=fig, hspace=0.3)
+        axes = [fig.add_subplot(gs[i, 0]) for i in range(10)]
 
-        # B components
+        # B components (panels 0-2)
         labels_B = ["Br", "Bt", "Bn"]
         colors_B = ["red", "green", "blue"]
 
         for i in range(min(3, B.shape[1])):
             axes[i].plot(T_mag, B[:, i], linewidth=1.2, color=colors_B[i],
-                         label=f"Solar Orbiter B{labels_B[i]}")
+                        label=f"Solar Orbiter B{labels_B[i]}")
             if l1_shifted and "B_gse_shifted" in l1_shifted:
                 B_l1 = l1_shifted["B_gse_shifted"]
                 T_l1_full = ensure_datetime_array(l1_shifted["time"])
@@ -1685,16 +1824,14 @@ class Plotter:
                     T_l1 = T_l1_full[mask_l1]
                     B_l1_i = B_l1[mask_l1, i]
                     axes[i].plot(T_l1, B_l1_i, linewidth=1.0,
-                                 color=colors_B[i], linestyle='--', alpha=0.7,
-                                 label=f"L1 B{labels_B[i]} (shifted)")
+                                color=colors_B[i], linestyle='--', alpha=0.7,
+                                label=f"L1 B{labels_B[i]} (shifted)")
             axes[i].set_ylabel(f"B{labels_B[i]} [nT]")
             axes[i].grid(True, alpha=0.3)
             axes[i].legend(loc="upper right", fontsize=8)
             axes[i].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
 
-        # ------------------------------------------------------------------
-        # EFLUX PANEL – HEATMAP (PAS-EFLUX), OLD STYLE
-        # ------------------------------------------------------------------
+        # EFLUX PANEL (panel 3)
         if swa and "eflux" in swa and swa.get("eflux") is not None:
             from matplotlib.dates import date2num
             import matplotlib.colors as mcolors
@@ -1735,19 +1872,19 @@ class Plotter:
                     )
                 else:
                     axes[3].text(0.5, 0.5, "No 2D eflux data",
-                                 ha="center", va="center",
-                                 transform=axes[3].transAxes)
+                                ha="center", va="center",
+                                transform=axes[3].transAxes)
             else:
                 axes[3].text(0.5, 0.5, "No Eflux data in window",
-                             ha="center", va="center",
-                             transform=axes[3].transAxes)
+                            ha="center", va="center",
+                            transform=axes[3].transAxes)
         else:
             axes[3].text(0.5, 0.5, "No Eflux data",
-                         ha="center", va="center",
-                         transform=axes[3].transAxes)
+                        ha="center", va="center",
+                        transform=axes[3].transAxes)
         axes[3].grid(True, alpha=0.3)
 
-        # Temperature
+        # Temperature (panel 4)
         if swa_moments and "T" in swa_moments:
             T_swa_full = ensure_datetime_array(swa_moments["time"])
             mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
@@ -1755,7 +1892,7 @@ class Plotter:
                 T_swa = T_swa_full[mask_swa]
                 T_data = np.array(swa_moments["T"])[mask_swa]
                 axes[4].plot(T_swa, T_data, linewidth=1.2, color="purple",
-                             label="Solar Orbiter T")
+                            label="Solar Orbiter T")
                 if l1_shifted and "T_shifted" in l1_shifted:
                     T_l1_full = ensure_datetime_array(l1_shifted["time"])
                     mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
@@ -1763,19 +1900,19 @@ class Plotter:
                         T_l1 = T_l1_full[mask_l1]
                         T_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
                         axes[4].plot(T_l1, T_l1_data, linewidth=1.0,
-                                     color="purple", linestyle='--', alpha=0.7,
-                                     label="L1 T (shifted)")
+                                    color="purple", linestyle='--', alpha=0.7,
+                                    label="L1 T (shifted)")
                 axes[4].set_ylabel("T [eV]")
                 axes[4].legend(loc="upper right", fontsize=8)
             else:
                 axes[4].text(0.5, 0.5, "No temperature data in window",
-                             ha="center", va="center", transform=axes[4].transAxes)
+                            ha="center", va="center", transform=axes[4].transAxes)
         else:
             axes[4].text(0.5, 0.5, "No temperature data",
-                         ha="center", va="center", transform=axes[4].transAxes)
+                        ha="center", va="center", transform=axes[4].transAxes)
         axes[4].grid(True, alpha=0.3)
 
-        # Density
+        # Density (panel 5)
         if swa_moments and "n" in swa_moments:
             T_swa_full = ensure_datetime_array(swa_moments["time"])
             mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
@@ -1783,7 +1920,7 @@ class Plotter:
                 T_swa = T_swa_full[mask_swa]
                 n_data = np.array(swa_moments["n"])[mask_swa]
                 axes[5].plot(T_swa, n_data, linewidth=1.2, color="orange",
-                             label="Solar Orbiter n")
+                            label="Solar Orbiter n")
                 if l1_shifted and "n_shifted" in l1_shifted:
                     T_l1_full = ensure_datetime_array(l1_shifted["time"])
                     mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
@@ -1791,19 +1928,19 @@ class Plotter:
                         T_l1 = T_l1_full[mask_l1]
                         n_l1_data = np.array(l1_shifted["n_shifted"])[mask_l1]
                         axes[5].plot(T_l1, n_l1_data, linewidth=1.0,
-                                     color="orange", linestyle='--', alpha=0.7,
-                                     label="L1 n (shifted)")
+                                    color="orange", linestyle='--', alpha=0.7,
+                                    label="L1 n (shifted)")
                 axes[5].set_ylabel("n [cm⁻³]")
                 axes[5].legend(loc="upper right", fontsize=8)
             else:
                 axes[5].text(0.5, 0.5, "No density data in window",
-                             ha="center", va="center", transform=axes[5].transAxes)
+                            ha="center", va="center", transform=axes[5].transAxes)
         else:
             axes[5].text(0.5, 0.5, "No density data",
-                         ha="center", va="center", transform=axes[5].transAxes)
+                        ha="center", va="center", transform=axes[5].transAxes)
         axes[5].grid(True, alpha=0.3)
 
-        # Velocity magnitude
+        # Velocity (panel 6)
         if swa_moments and "V" in swa_moments:
             T_swa_full = ensure_datetime_array(swa_moments["time"])
             mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
@@ -1812,7 +1949,7 @@ class Plotter:
                 V_data = np.array(swa_moments["V"])[mask_swa]
                 V_mag  = np.linalg.norm(V_data, axis=1)
                 axes[6].plot(T_swa, V_mag, linewidth=1.2, color="cyan",
-                             label="Solar Orbiter V")
+                            label="Solar Orbiter V")
                 if l1_shifted and "V_shifted" in l1_shifted:
                     T_l1_full = ensure_datetime_array(l1_shifted["time"])
                     mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
@@ -1821,29 +1958,29 @@ class Plotter:
                         V_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
                         V_l1_mag = np.linalg.norm(V_l1, axis=1)
                         axes[6].plot(T_l1, V_l1_mag, linewidth=1.0,
-                                     color="cyan", linestyle='--', alpha=0.7,
-                                     label="L1 V (shifted)")
+                                    color="cyan", linestyle='--', alpha=0.7,
+                                    label="L1 V (shifted)")
                 axes[6].set_ylabel("V [km/s]")
                 axes[6].legend(loc="upper right", fontsize=8)
             else:
                 axes[6].text(0.5, 0.5, "No velocity data in window",
-                             ha="center", va="center", transform=axes[6].transAxes)
+                            ha="center", va="center", transform=axes[6].transAxes)
         else:
             axes[6].text(0.5, 0.5, "No velocity data",
-                         ha="center", va="center", transform=axes[6].transAxes)
+                        ha="center", va="center", transform=axes[6].transAxes)
         axes[6].grid(True, alpha=0.3)
 
-        # Dst panel
+        # Dst (panel 7)
         has_dst_data = False
         if dst_shifted:
             axes[7].plot(dst_shifted["time"], dst_shifted["dst_shifted"],
-                         linewidth=1.5, color="blue",
-                         label="Measured Dst (Time-Shifted)", alpha=0.8)
+                        linewidth=1.5, color="blue",
+                        label="Measured Dst (Time-Shifted)", alpha=0.8)
             has_dst_data = True
         if dst_pred:
             axes[7].plot(dst_pred["time"], dst_pred["dst_predicted"],
-                         linewidth=1.5, color="red", linestyle="--",
-                         label="Predicted Dst (Crossover)", alpha=0.8)
+                        linewidth=1.5, color="red", linestyle="--",
+                        label="Predicted Dst (Crossover)", alpha=0.8)
             has_dst_data = True
 
         if has_dst_data:
@@ -1856,21 +1993,21 @@ class Plotter:
             axes[7].legend(loc="upper right", fontsize=8)
         else:
             axes[7].text(0.5, 0.5, "No Dst data",
-                         ha="center", va="center", transform=axes[7].transAxes)
+                        ha="center", va="center", transform=axes[7].transAxes)
         axes[7].grid(True, alpha=0.3)
 
-        # Kp panel
+        # Kp (panel 8)
         has_kp_data = False
         if kp_shifted:
             axes[8].plot(kp_shifted["time"], kp_shifted["kp_shifted"],
-                         linewidth=1.5, color="blue", marker='o', markersize=4,
-                         label="Measured Kp (Time-Shifted)", alpha=0.8)
+                        linewidth=1.5, color="blue", marker='o', markersize=4,
+                        label="Measured Kp (Time-Shifted)", alpha=0.8)
             has_kp_data = True
         if kp_pred:
             axes[8].plot(kp_pred["time"], kp_pred["kp_predicted"],
-                         linewidth=1.5, color="red", linestyle="--",
-                         marker='s', markersize=4,
-                         label="Predicted Kp (Crossover)", alpha=0.8)
+                        linewidth=1.5, color="red", linestyle="--",
+                        marker='s', markersize=4,
+                        label="Predicted Kp (Crossover)", alpha=0.8)
             has_kp_data = True
 
         if has_kp_data:
@@ -1883,9 +2020,69 @@ class Plotter:
             axes[8].legend(loc="upper right", fontsize=8)
         else:
             axes[8].text(0.5, 0.5, "No Kp data",
-                         ha="center", va="center", transform=axes[8].transAxes)
+                        ha="center", va="center", transform=axes[8].transAxes)
         axes[8].grid(True, alpha=0.3)
 
+        # NEW: Distance and Angle (panel 9)
+        sc_times = spacecraft_ephemeris["times"]
+        sc_positions = spacecraft_ephemeris["positions"]
+        
+        mask_sc = [(t0 <= t <= t1) for t in sc_times]
+        if np.any(mask_sc):
+            T_sc = np.array(sc_times)[mask_sc]
+            pos_sc = sc_positions[mask_sc]
+            
+            # Calculate Earth positions at these times
+            earth_positions = np.array([
+                SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
+                for t in T_sc
+            ])
+            
+            # Calculate distances (in AU)
+            distances = np.linalg.norm(pos_sc - earth_positions, axis=1) / AU_KM
+            
+            # Calculate angles relative to Sun-Earth line
+            angles = []
+            for i in range(len(T_sc)):
+                earth_vec = earth_positions[i]
+                sc_vec = pos_sc[i]
+                
+                # Normalize vectors (both from Sun at origin)
+                earth_hat = earth_vec / np.linalg.norm(earth_vec)
+                sc_hat = sc_vec / np.linalg.norm(sc_vec)
+                
+                # Angle between vectors
+                cos_angle = np.dot(earth_hat, sc_hat)
+                cos_angle = np.clip(cos_angle, -1.0, 1.0)
+                angle_rad = np.arccos(cos_angle)
+                angle_deg = np.degrees(angle_rad)
+                angles.append(angle_deg)
+            
+            angles = np.array(angles)
+            
+            # Plot distance on left axis (black)
+            ax_dist = axes[9]
+            ax_dist.plot(T_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
+            ax_dist.set_ylabel('Distance [AU]', color='k', fontsize=11)
+            ax_dist.tick_params(axis='y', labelcolor='k')
+            ax_dist.grid(True, alpha=0.3)
+            
+            # Plot angle on right axis (red)
+            ax_angle = ax_dist.twinx()
+            ax_angle.plot(T_sc, angles, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
+            ax_angle.set_ylabel('Angle [deg]', color='r', fontsize=11)
+            ax_angle.tick_params(axis='y', labelcolor='r')
+            
+            # Combined legend
+            lines1, labels1 = ax_dist.get_legend_handles_labels()
+            lines2, labels2 = ax_angle.get_legend_handles_labels()
+            ax_dist.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+        else:
+            axes[9].text(0.5, 0.5, "No spacecraft ephemeris in window",
+                        ha="center", va="center", transform=axes[9].transAxes)
+            axes[9].grid(True, alpha=0.3)
+
+        # Time axis formatting
         from matplotlib.dates import DateFormatter, AutoDateLocator
         axes[-1].set_xlabel("Time (UTC)")
         locator = AutoDateLocator()
@@ -1894,8 +2091,8 @@ class Plotter:
         axes[-1].xaxis.set_major_formatter(formatter)
 
         axes[-1].set_xlim(T_mag[0], T_mag[-1])
-        for i in range(8):
-            axes[i].sharex(axes[8])
+        for i in range(9):  # CHANGED: 9 instead of 8
+            axes[i].sharex(axes[9])  # CHANGED: share with axes[9] instead of axes[8]
             axes[i].tick_params(labelbottom=False)
 
         plt.suptitle(
@@ -1904,7 +2101,7 @@ class Plotter:
         )
         fig.autofmt_xdate()
         return fig
-    
+
 # ------------------------------- Main driver ------------------------------ #
 
 def main():
@@ -2008,7 +2205,12 @@ def main():
 
         print("\nGenerating plots...")
         for e in all_events["Solar Orbiter"]:
-            fig = Plotter.plot_solo_insitu_with_dst(e, solo_preloaded)
+            fig = Plotter.plot_solo_insitu_with_dst(
+                e, 
+                solo_preloaded,
+                spacecraft_data["Solar Orbiter"],
+                START_DATE
+            )
             if fig is None:
                 print(f"⚠️  Could not create plot for {e['time']}")
 
