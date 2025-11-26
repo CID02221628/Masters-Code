@@ -134,13 +134,13 @@ AU_KM            = 1.496e8
 YEAR_DAYS        = 365.25
 MEAN_MOTION      = 2 * np.pi / YEAR_DAYS
 
-START_DATE       = datetime(2020, 1, 1)
+START_DATE       = datetime(2018, 1, 1)
 END_DATE         = datetime(2024, 12, 31)
 ECCENTRICITY     = 0.10
-SUN_EARTH_TOL_AU = 0.08
-DRO_TOL_AU       = 0.50
+SUN_EARTH_TOL_AU = 0.1
+DRO_TOL_AU       = 0.55
 DT_HOURS         = 6
-INSITU_WINDOW_HR = 72  # ± 3 days
+INSITU_WINDOW_HR = 120  # ± 5 days
 
 # target cadence for MAG decimation (~1 point per minute per day-file)
 MAG_TARGET_POINTS_PER_DAY = 1440
@@ -702,6 +702,319 @@ class BallisticPropagation:
         if not has_b:
             return None
         return result
+
+
+# ------------------------------ ICME Catalogue --------------------------- #
+
+class ICMECatalogue:   
+    @staticmethod
+    def load_richardson_cane():
+        """
+        Load Richardson & Cane ICME catalogue from web.
+        Returns list of ICME events with start/end times, or None on failure.
+        """
+        print("\n[ICME] Loading Richardson & Cane ICME catalogue...")
+        
+        url = "http://www.srl.caltech.edu/ACE/ASC/DATA/level3/icmetable2.htm"
+        
+        try:
+            import requests
+            from io import StringIO
+            
+            # Download with proper encoding
+            print(f"    Downloading from {url}")
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            # Use cp775 encoding (not UTF-8)
+            html_content = response.content.decode('cp775')
+            print(f"    ✓ Downloaded {len(html_content)} characters")
+            
+            # Parse with pandas using StringIO
+            dfs = pd.read_html(StringIO(html_content))
+            
+            if not dfs:
+                print("    ❌ No tables found")
+                return None
+            
+            df = dfs[0]
+            print(f"    ✓ Found table with {len(df)} rows")
+            
+            # Parse the table
+            icme_list = ICMECatalogue._parse_richardson_cane_table(df)
+            
+            if icme_list:
+                print(f"    ✓ Parsed {len(icme_list)} ICME events")
+                return icme_list
+            else:
+                print("    ⚠️  Parsing failed - no events extracted")
+                return None
+                
+        except Exception as e:
+            print(f"    ❌ Failed to download/parse catalogue: {e}")
+            print("\n    MANUAL WORKAROUND:")
+            print("    1. Visit: http://www.srl.caltech.edu/ACE/ASC/DATA/level3/icmetable2.htm")
+            print("    2. Save the page as 'icme_catalogue.html'")
+            print("    3. Place it in the working directory")
+            print("    4. Re-run the script")
+            return None
+    
+    @staticmethod
+    def _parse_richardson_cane_table(df):
+        """
+        Parse Richardson & Cane ICME table from DataFrame.
+        
+        Table format: Y/M/D HHMM for start and end times
+        """
+        icme_list = []
+        
+        # Flatten multi-level columns by taking first level
+        df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+        
+        # Column indices:
+        # 0: Disturbance time
+        # 1: ICME start
+        # 2: ICME end
+        # 14: MC flag (1/2/3 = MC, else = Ejecta)
+        
+        for idx, row in df.iterrows():
+            try:
+                # Skip header rows (first ~28 rows are headers/metadata)
+                if idx < 28:
+                    continue
+                
+                # Get start and end times (columns 1 and 2)
+                start_str = str(row.iloc[1]).strip()
+                end_str = str(row.iloc[2]).strip()
+                
+                # Skip if invalid
+                if start_str == 'nan' or end_str == 'nan' or start_str == '...' or end_str == '...':
+                    continue
+                
+                # Parse datetime: format is "YYYY/MM/DD HHMM"
+                start_dt = datetime.strptime(start_str, "%Y/%m/%d %H%M")
+                end_dt = datetime.strptime(end_str, "%Y/%m/%d %H%M")
+                
+                # Get MC flag (column 14)
+                mc_flag = str(row.iloc[14]).strip()
+                icme_type = 'MC' if mc_flag in ['1', '2', '3'] else 'E'
+                
+                # Get shock flag (from disturbance time vs ICME start)
+                disturbance_str = str(row.iloc[0]).strip()
+                shock_flag = 'N'
+                if disturbance_str != 'nan' and disturbance_str != start_str:
+                    shock_flag = 'Y'
+                
+                icme_list.append({
+                    'start': start_dt,
+                    'end': end_dt,
+                    'type': icme_type,
+                    'shock': shock_flag,
+                    'v_max': 400,  # Default (not always in table)
+                    'b_max': 10,   # Default (not always in table)
+                    'comment': f"{icme_type} event"
+                })
+                
+            except Exception as e:
+                # Skip rows that can't be parsed
+                continue
+        
+        return icme_list
+    
+    @staticmethod
+    def load_from_local_file(filepath='icme_catalogue.html'):
+        """
+        Load Richardson & Cane catalogue from local HTML file.
+        Fallback if web download fails.
+        """
+        print(f"\n[ICME] Loading from local file: {filepath}")
+        
+        try:
+            import requests
+            from io import StringIO
+            
+            with open(filepath, 'rb') as f:
+                html_content = f.read().decode('cp775')
+            
+            dfs = pd.read_html(StringIO(html_content))
+            
+            if not dfs:
+                print("    ❌ No tables found")
+                return None
+            
+            df = dfs[0]
+            print(f"    ✓ Found table with {len(df)} rows")
+            
+            icme_list = ICMECatalogue._parse_richardson_cane_table(df)
+            
+            if icme_list:
+                print(f"    ✓ Parsed {len(icme_list)} ICME events")
+                return icme_list
+            else:
+                print("    ⚠️  Parsing failed")
+                return None
+                
+        except Exception as e:
+            print(f"    ❌ Failed to load local file: {e}")
+            return None
+    
+    @staticmethod
+    def backpropagate_icmes(event, spacecraft_ephemeris, epoch_date, icme_list,
+                        common_data=None, tolerance_hours=24):
+        """
+        Back-propagate ICMEs from Earth to spacecraft location.
+        
+        Args:
+            event: Crossover event dict
+            spacecraft_ephemeris: Spacecraft position data
+            epoch_date: Epoch datetime
+            icme_list: List of ICME events at Earth
+            common_data: MAG+SWA interpolated data (for actual V measurement)
+            tolerance_hours: Matching tolerance (default ±12 hours)
+            
+        Returns:
+            List of ICME intervals at spacecraft, or None
+        """
+        print(f"\n{'='*80}")
+        print(f"[ICME BACKPROP] Starting back-propagation for event")
+        print(f"{'='*80}")
+        
+        if not icme_list:
+            print("[ICME BACKPROP] ❌ No ICME catalogue provided")
+            return None
+        
+        # Get spacecraft position at crossover
+        t_crossover = event["time"]
+        sc_pos = event["spacecraft_pos"]
+        
+        print(f"[ICME BACKPROP] Crossover time: {t_crossover}")
+        print(f"[ICME BACKPROP] S/C position: [{sc_pos[0]/AU_KM:.3f}, {sc_pos[1]/AU_KM:.3f}, {sc_pos[2]/AU_KM:.3f}] AU")
+        
+        # Calculate distance to Earth
+        earth_pos = SunEarthLineAnalyzer.earth_position_at_time(t_crossover, epoch_date)
+        distance_km = np.linalg.norm(sc_pos - earth_pos)
+        distance_au = distance_km / AU_KM
+        
+        print(f"[ICME BACKPROP] Earth position: [{earth_pos[0]/AU_KM:.3f}, {earth_pos[1]/AU_KM:.3f}, {earth_pos[2]/AU_KM:.3f}] AU")
+        print(f"[ICME BACKPROP] Distance S/C → Earth: {distance_au:.3f} AU ({distance_km:.1e} km)")
+        
+        # Get solar wind velocity from measurements if available
+        if common_data and "V" in common_data:
+            # Find V measurement closest to crossover time
+            times_common = common_data["time"]
+            time_diffs = [abs((t - t_crossover).total_seconds()) for t in times_common]
+            idx_closest = np.argmin(time_diffs)
+            V_vec = common_data["V"][idx_closest]
+            v_sw_kms = np.linalg.norm(V_vec)
+            print(f"[ICME BACKPROP] ✓ Using measured V_sw = {v_sw_kms:.1f} km/s")
+            print(f"[ICME BACKPROP]   V vector: [{V_vec[0]:.1f}, {V_vec[1]:.1f}, {V_vec[2]:.1f}] km/s")
+            print(f"[ICME BACKPROP]   Closest measurement: {times_common[idx_closest]} (Δt = {time_diffs[idx_closest]/60:.1f} min)")
+        else:
+            # Use typical solar wind speed as fallback
+            v_sw_kms = 400.0
+            print(f"[ICME BACKPROP] ⚠️  Using default V_sw = {v_sw_kms:.1f} km/s (no SWA data available)")
+        
+        # Calculate propagation time
+        propagation_time_sec = distance_km / v_sw_kms
+        propagation_time_hrs = propagation_time_sec / 3600.0
+        propagation_time_days = propagation_time_hrs / 24.0
+        
+        print(f"[ICME BACKPROP] Propagation time: {propagation_time_hrs:.1f} hours ({propagation_time_days:.2f} days)")
+        
+        # Predicted arrival time at Earth
+        t_predicted_earth = t_crossover + timedelta(seconds=propagation_time_sec)
+        
+        print(f"[ICME BACKPROP] Predicted Earth arrival: {t_predicted_earth}")
+        print(f"[ICME BACKPROP] Tolerance window: ±{tolerance_hours} hours")
+        
+        # Find matching ICMEs (within tolerance)
+        matched_icmes = []
+        tolerance_td = timedelta(hours=tolerance_hours)
+        
+        print(f"\n[ICME BACKPROP] Checking against {len(icme_list)} ICMEs in catalogue...")
+        print(f"{'─'*80}")
+        
+        near_misses = []
+        
+        for i, icme in enumerate(icme_list, 1):
+            # Check if predicted arrival matches ICME arrival
+            time_diff_start = abs(t_predicted_earth - icme['start'])
+            time_diff_end = abs(t_predicted_earth - icme['end'])
+            
+            # Show all ICMEs within 5 days for context
+            if time_diff_start <= timedelta(days=5) or time_diff_end <= timedelta(days=5):
+                print(f"\n[ICME BACKPROP] ICME #{i}: {icme['start']} → {icme['end']}")
+                print(f"                Type: {icme['type']}, Shock: {icme['shock']}")
+                print(f"                Predicted arrival vs ICME start: {time_diff_start.total_seconds()/3600:.1f} hours")
+                print(f"                Predicted arrival vs ICME end:   {time_diff_end.total_seconds()/3600:.1f} hours")
+                
+                # Check matching criteria
+                within_duration = (icme['start'] - tolerance_td <= t_predicted_earth <= icme['end'] + tolerance_td)
+                near_start = (time_diff_start <= tolerance_td)
+                near_end = (time_diff_end <= tolerance_td)
+                
+                print(f"                Within ICME duration ± tolerance: {within_duration}")
+                print(f"                Near ICME start (± {tolerance_hours}h): {near_start}")
+                print(f"                Near ICME end (± {tolerance_hours}h): {near_end}")
+                
+                if within_duration or near_start or near_end:
+                    print(f"                ✓ MATCH FOUND!")
+                else:
+                    print(f"                ✗ No match (outside tolerance)")
+                    near_misses.append({
+                        'icme': icme,
+                        'time_diff_hours': min(time_diff_start.total_seconds()/3600, 
+                                            time_diff_end.total_seconds()/3600)
+                    })
+            
+            # Match if predicted arrival is within ICME duration ± tolerance
+            if (icme['start'] - tolerance_td <= t_predicted_earth <= icme['end'] + tolerance_td or
+                time_diff_start <= tolerance_td or time_diff_end <= tolerance_td):
+                
+                # Back-propagate ICME times to spacecraft
+                sc_start = icme['start'] - timedelta(seconds=propagation_time_sec)
+                sc_end = icme['end'] - timedelta(seconds=propagation_time_sec)
+                
+                print(f"\n[ICME BACKPROP] ✓✓✓ MATCHED ICME ✓✓✓")
+                print(f"                Earth arrival: {icme['start']} → {icme['end']}")
+                print(f"                S/C arrival:   {sc_start} → {sc_end}")
+                print(f"                Duration: {(icme['end']-icme['start']).total_seconds()/3600:.1f} hours")
+                
+                matched_icmes.append({
+                    'earth_start': icme['start'],
+                    'earth_end': icme['end'],
+                    'sc_start': sc_start,
+                    'sc_end': sc_end,
+                    'type': icme['type'],
+                    'shock': icme['shock'],
+                    'comment': icme['comment'],
+                    'distance_au': distance_au,
+                    'propagation_hours': propagation_time_hrs,
+                    'v_sw_used': v_sw_kms
+                })
+        
+        print(f"\n{'─'*80}")
+        
+        if matched_icmes:
+            print(f"[ICME BACKPROP] ✓ Found {len(matched_icmes)} matching ICME(s)!")
+            for i, match in enumerate(matched_icmes, 1):
+                print(f"  {i}. {match['type']} @ Earth: {match['earth_start']} → {match['earth_end']}")
+                print(f"     @ S/C: {match['sc_start']} → {match['sc_end']}")
+        else:
+            print(f"[ICME BACKPROP] ✗ No matching ICMEs found")
+            
+            if near_misses:
+                print(f"\n[ICME BACKPROP] Near misses (within 5 days):")
+                near_misses.sort(key=lambda x: x['time_diff_hours'])
+                for nm in near_misses[:3]:  # Show top 3 near misses
+                    icme = nm['icme']
+                    print(f"  • {icme['start']} ({icme['type']}): missed by {nm['time_diff_hours']:.1f} hours")
+            else:
+                print(f"[ICME BACKPROP] No ICMEs even close (within 5 days of prediction)")
+        
+        print(f"{'='*80}\n")
+        
+        return matched_icmes if matched_icmes else None
 
 # ------------------------ Solo in-situ + geomag -------------------------- #
 
@@ -1455,7 +1768,7 @@ class SoloDataLoader:
         }
 
     @staticmethod
-    def preload_all(events, spacecraft_ephemeris, epoch_date, window_hours=72):
+    def preload_all(events, spacecraft_ephemeris, epoch_date, icme_catalogue, window_hours=72):
         all_data = {}
         for event in tqdm(events, desc="Loading", ncols=80):
             t_ev  = event["time"]
@@ -1482,6 +1795,7 @@ class SoloDataLoader:
             kp_pred = None
             kp_shifted = None
             l1_shifted = None
+            common = None
 
             if mag and swam and ("V" in swam) and ("n" in swam):
                 common = SoloDataLoader.interpolate_to_mag_time(mag, swam)
@@ -1500,8 +1814,8 @@ class SoloDataLoader:
                     sc_pos_interp = np.zeros((len(common_times_sec), 3))
                     for i in range(3):
                         f_pos = interp1d(sc_times_sec, sc_positions[:, i],
-                                         kind="linear", bounds_error=False,
-                                         fill_value=np.nan)
+                                        kind="linear", bounds_error=False,
+                                        fill_value=np.nan)
                         sc_pos_interp[:, i] = f_pos(common_times_sec)
 
                     kp_pred = SoloDataLoader.predict_kp_newell(
@@ -1516,6 +1830,25 @@ class SoloDataLoader:
                         l1_shifted = BallisticPropagation.apply_ballistic_shift_to_l1(
                             common, l1, spacecraft_ephemeris, epoch_date
                         )
+            
+            # Back-propagate ICMEs using measured velocity if available
+            icmes = None
+            if icme_catalogue:
+                print(f"\n[PRELOAD] Checking ICME catalogue for event at {t_ev}")
+                icmes = ICMECatalogue.backpropagate_icmes(
+                    event, spacecraft_ephemeris, epoch_date, icme_catalogue,
+                    common_data=common
+                )
+                if icmes:
+                    print(f"    ✓ Matched {len(icmes)} ICME(s)")
+                    for i, icme in enumerate(icmes, 1):
+                        print(f"      {i}. Earth: {icme['earth_start'].strftime('%b %d %H:%M')} → "
+                            f"{icme['earth_end'].strftime('%b %d %H:%M')} ({icme['type']})")
+                        print(f"         S/C:   {icme['sc_start'].strftime('%b %d %H:%M')} → "
+                            f"{icme['sc_end'].strftime('%b %d %H:%M')} "
+                            f"(Δt={icme['propagation_hours']:.1f} hrs)")
+                else:
+                    print(f"    No ICMEs matched")
 
             all_data[t_ev] = {
                 "mag":           mag,
@@ -1529,6 +1862,7 @@ class SoloDataLoader:
                 "kp_shifted":    kp_shifted,
                 "l1_data":       l1,
                 "l1_shifted":    l1_shifted,
+                "icmes":         icmes,
             }
 
         return all_data
@@ -1586,8 +1920,8 @@ class Plotter:
 
     @staticmethod
     def plot_event_detail(event, spacecraft_name, constellation,
-                          spacecraft_data, epoch_date,
-                          context_days=TRACK_CONTEXT_DAYS):
+                        spacecraft_data, epoch_date,
+                        context_days=TRACK_CONTEXT_DAYS):
         fig, ax1 = plt.subplots(1, 1, figsize=(10, 10))
         ax1.set_aspect("equal")
 
@@ -1602,10 +1936,10 @@ class Plotter:
         dro_orbit = dro_sat["orbit"]["dro_helio"] / AU_KM
 
         ax1.plot(0, 0, "o", ms=12, color="#FDB813", mec="#F37021", mew=1.5,
-                 label="Sun")
+                label="Sun")
         theta = np.linspace(0, 2 * np.pi, 1000)
         ax1.plot(np.cos(theta), np.sin(theta), "b--", lw=1, alpha=0.2,
-                 label="Earth orbit")
+                label="Earth orbit")
 
         earth_pos = event["earth_pos"] / AU_KM
         sc_pos    = event["spacecraft_pos"][:2] / AU_KM
@@ -1622,29 +1956,50 @@ class Plotter:
 
         if any(mask):
             sc_xy = (pos[mask] / AU_KM)[:, :2]
-            ax1.plot(sc_xy[:, 0], sc_xy[:, 1], "-", lw=2, alpha=0.9,
-                     label=f"{spacecraft_name} (±{half:.0f} d)")
+            ax1.plot(sc_xy[:, 0], sc_xy[:, 1], "-", lw=2, alpha=0.9, color="#45B7D1",
+                    label=f"{spacecraft_name} (±{half:.0f} d)")
             radii.extend(np.linalg.norm(sc_xy, axis=1).tolist())
 
+            # Plot Earth trajectory
             earth_xy = []
             for t in np.array(times)[mask]:
                 epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) / AU_KM
                 earth_xy.append(epos[:2])
             earth_xy = np.array(earth_xy)
-            ax1.plot(earth_xy[:, 0], earth_xy[:, 1], "-", lw=2, alpha=0.9,
-                     label=f"Earth (±{half:.0f} d)")
+            ax1.plot(earth_xy[:, 0], earth_xy[:, 1], "-", lw=2, alpha=0.9, color="gold",
+                    label=f"Earth (±{half:.0f} d)")
             radii.extend(np.linalg.norm(earth_xy, axis=1).tolist())
+            
+            # NEW: Plot L1 trajectory (0.01 AU sunward from Earth)
+            l1_xy = []
+            for t in np.array(times)[mask]:
+                epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
+                # L1 is 0.01 AU sunward from Earth along Sun-Earth line
+                earth_sun_dir = -epos / np.linalg.norm(epos)
+                l1_pos = epos + earth_sun_dir * (0.01 * AU_KM)
+                l1_xy.append(l1_pos[:2] / AU_KM)
+            l1_xy = np.array(l1_xy)
+            ax1.plot(l1_xy[:, 0], l1_xy[:, 1], "-", lw=2, alpha=0.9, color="lime",
+                    label=f"L1 (±{half:.0f} d)")
+            radii.extend(np.linalg.norm(l1_xy, axis=1).tolist())
 
         ax1.plot(dro_orbit[:, 0], dro_orbit[:, 1], "r-", lw=2, alpha=0.7,
-                 label=f"DRO-{event['dro_id']}")
+                label=f"DRO-{event['dro_id']}")
         radii.extend(np.linalg.norm(dro_orbit[:, :2], axis=1).tolist())
 
         ax1.plot(earth_pos[0], earth_pos[1], "o", ms=10, color="blue",
-                 mec="white", mew=1.5, label="Earth @ event")
+                mec="white", mew=1.5, label="Earth @ event")
         ax1.plot(sc_pos[0], sc_pos[1], "*", ms=15, color="gold",
-                 mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+                mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+        
+        # NEW: Plot L1 point at event time
+        earth_sun_dir = -event["earth_pos"] / np.linalg.norm(event["earth_pos"])
+        l1_event = (event["earth_pos"] + earth_sun_dir * (0.01 * AU_KM)) / AU_KM
+        ax1.plot(l1_event[0], l1_event[1], "D", ms=8, color="lime",
+                mec="darkgreen", mew=1.5, label="L1 @ event")
+        
         ax1.plot([0, earth_pos[0]], [0, earth_pos[1]], "g--", lw=1.5,
-                 alpha=0.5, label="Sun–Earth line")
+                alpha=0.5, label="Sun–Earth line")
 
         rmax = max(radii) if radii else max(np.linalg.norm(earth_pos[:2]),
                                             np.linalg.norm(sc_pos), 1.2)
@@ -1656,16 +2011,16 @@ class Plotter:
         ax1.set_xlabel("X [AU]")
         ax1.set_ylabel("Y [AU]")
         ax1.set_title(f"{spacecraft_name} — Heliocentric — {event['time'].strftime('%Y-%m-%d')}")
-        ax1.legend(loc="best")
+        ax1.legend(loc="best", fontsize=9)
         ax1.grid(True, alpha=0.3)
         plt.tight_layout()
         return fig
 
     @staticmethod
     def plot_event_detail_earth_frame(event, spacecraft_name,
-                                      constellation, spacecraft_data,
-                                      epoch_date,
-                                      context_days=TRACK_CONTEXT_DAYS):
+                                    constellation, spacecraft_data,
+                                    epoch_date,
+                                    context_days=TRACK_CONTEXT_DAYS):
         fig, ax1 = plt.subplots(1, 1, figsize=(10, 10))
         ax1.set_aspect("equal")
 
@@ -1681,7 +2036,7 @@ class Plotter:
         dro_orbit_earth = dro_1["orbit"]["dro_earth"] / AU_KM
 
         ax1.plot(0, 0, "o", ms=12, color="#4A90E2", mec="white", mew=1.5,
-                 label="Earth", zorder=10)
+                label="Earth", zorder=10)
 
         half = context_days / 2.0
         t0   = event["time"] - timedelta(days=half)
@@ -1694,6 +2049,7 @@ class Plotter:
         radii = []
 
         if any(mask):
+            # Spacecraft trajectory in Earth frame
             sc_e = []
             for t, pxyz in zip(np.array(times)[mask], pos_helio[mask]):
                 days  = (t - epoch_date).total_seconds() / 86400
@@ -1706,11 +2062,22 @@ class Plotter:
                 sc_e.append([x_e, y_e])
             sc_e = np.array(sc_e) / AU_KM
             ax1.plot(sc_e[:, 0], sc_e[:, 1], "-", lw=2, color="#45B7D1",
-                     alpha=0.9, label=f"{spacecraft_name} (±{half:.0f} d)")
+                    alpha=0.9, label=f"{spacecraft_name} (±{half:.0f} d)")
             radii.extend(np.linalg.norm(sc_e, axis=1).tolist())
+            
+            # NEW: L1 trajectory in Earth frame (fixed at ~-0.01 AU on x-axis)
+            # In the rotating Earth frame, L1 is always along the -x axis (toward Sun)
+            l1_e = []
+            for t in np.array(times)[mask]:
+                # In Earth frame, L1 is fixed at -0.01 AU along x-axis
+                l1_e.append([-0.01, 0.0])
+            l1_e = np.array(l1_e)
+            ax1.plot(l1_e[:, 0], l1_e[:, 1], "-", lw=2, color="lime",
+                    alpha=0.9, label=f"L1 (±{half:.0f} d)")
+            radii.extend(np.abs(l1_e[:, 0]).tolist())
 
         ax1.plot(dro_orbit_earth[:, 0], dro_orbit_earth[:, 1], "r-", lw=2,
-                 alpha=0.7, label=f"DRO-{event['dro_id']} ({dro_sat['rotation_deg']}°)")
+                alpha=0.7, label=f"DRO-{event['dro_id']} ({dro_sat['rotation_deg']}°)")
         radii.extend(np.linalg.norm(dro_orbit_earth, axis=1).tolist())
 
         days_ev  = (event["time"] - epoch_date).total_seconds() / 86400
@@ -1725,7 +2092,11 @@ class Plotter:
         sc_e_pt = np.array([sc_x_e, sc_y_e]) / AU_KM
 
         ax1.plot(sc_e_pt[0], sc_e_pt[1], "*", ms=15, color="gold",
-                 mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+                mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+        
+        # NEW: L1 point at event time (fixed position in Earth frame)
+        ax1.plot(-0.01, 0.0, "D", ms=8, color="lime",
+                mec="darkgreen", mew=1.5, label="L1 @ event")
 
         sun_rel = -e_h
         sun_x_e = sun_rel[0] * c_ev - sun_rel[1] * s_ev
@@ -1733,11 +2104,11 @@ class Plotter:
         sun_e   = np.array([sun_x_e, sun_y_e]) / AU_KM
 
         ax1.plot(sun_e[0], sun_e[1], "o", ms=14, color="#FDB813",
-                 mec="#F37021", mew=2, label="Sun @ event", zorder=9)
+                mec="#F37021", mew=2, label="Sun @ event", zorder=9)
         radii.append(np.linalg.norm(sun_e))
 
         ax1.plot([0, sun_e[0]], [0, sun_e[1]], "g--", lw=1.5,
-                 alpha=0.5, label="Sun–Earth line")
+                alpha=0.5, label="Sun–Earth line")
 
         rmax = max(radii) if radii else 1.2
         pad  = 0.10 * rmax
@@ -1748,11 +2119,54 @@ class Plotter:
         ax1.set_xlabel("X [AU] (Earth Frame)")
         ax1.set_ylabel("Y [AU] (Earth Frame)")
         ax1.set_title(f"{spacecraft_name} — Earth-Centered — {event['time'].strftime('%Y-%m-%d')}")
-        ax1.legend(loc="best", fontsize=10)
+        ax1.legend(loc="best", fontsize=9)
         ax1.grid(True, alpha=0.3)
         plt.tight_layout()
         return fig
 
+    @staticmethod
+    def _add_icme_shading(axes, icmes, t0, t1):
+        """
+        Add ICME shaded regions to all axes.
+        
+        Args:
+            axes: List of matplotlib axes
+            icmes: List of ICME dicts with sc_start, sc_end, type
+            t0, t1: Time window bounds
+        """
+        if not icmes:
+            return
+        
+        icme_colors = ['red', 'orange', 'purple', 'brown', 'pink']
+        
+        for i, icme in enumerate(icmes):
+            color = icme_colors[i % len(icme_colors)]
+            sc_start = np.datetime64(icme['sc_start'])
+            sc_end = np.datetime64(icme['sc_end'])
+            
+            # Only shade if ICME overlaps with plot window
+            if sc_end < np.datetime64(t0) or sc_start > np.datetime64(t1):
+                continue
+            
+            # Add shading to all panels except the last (distance/angle)
+            for ax_idx in range(len(axes) - 1):
+                axes[ax_idx].axvspan(sc_start, sc_end, alpha=0.15, color=color, zorder=0)
+                
+                # Add vertical lines at boundaries
+                axes[ax_idx].axvline(sc_start, color=color, linestyle=':', 
+                                    linewidth=1.0, alpha=0.5, zorder=1)
+                axes[ax_idx].axvline(sc_end, color=color, linestyle=':', 
+                                    linewidth=1.0, alpha=0.5, zorder=1)
+            
+            # Add label to top panel
+            mid_time = sc_start + (sc_end - sc_start) / 2
+            y_pos = axes[0].get_ylim()[1] * (0.95 - i * 0.08)  # Stack labels
+            axes[0].text(mid_time, y_pos, 
+                        f"ICME {i+1}: {icme['type']}", 
+                        ha='center', va='top', fontsize=7,
+                        bbox=dict(boxstyle='round,pad=0.3', 
+                                facecolor='white', alpha=0.7, edgecolor=color))
+            
     @staticmethod
     def plot_solo_insitu_with_dst(event, preloaded, spacecraft_ephemeris, epoch_date, window_hours=INSITU_WINDOW_HR):
         center = event.get("time")
@@ -1809,7 +2223,11 @@ class Plotter:
         gs = GridSpec(10, 1, figure=fig, hspace=0.3)
         axes = [fig.add_subplot(gs[i, 0]) for i in range(10)]
 
-        # B components (panels 0-2)
+        icmes = d.get("icmes")
+        if icmes:
+            Plotter._add_icme_shading(axes, icmes, t0, t1)
+
+
         labels_B = ["Br", "Bt", "Bn"]
         colors_B = ["red", "green", "blue"]
 
@@ -2110,6 +2528,23 @@ def main():
     print(f"DRO e = {ECCENTRICITY}, tolerances: SE={SUN_EARTH_TOL_AU} AU, "
           f"DRO={DRO_TOL_AU} AU, dt={DT_HOURS} h")
 
+    # Load ICME catalogue
+    icme_catalogue = ICMECatalogue.load_richardson_cane()
+    if not icme_catalogue:
+        # Try loading from local file as fallback
+        print("    Attempting to load from local file...")
+        icme_catalogue = ICMECatalogue.load_from_local_file()
+    
+    if not icme_catalogue:
+        print("\n⚠️  WARNING: Could not load ICME catalogue")
+        print("    ICME back-propagation will be skipped")
+        print("    Analysis will continue without ICME data\n")
+    else:
+        # Filter to date range
+        icme_catalogue = [icme for icme in icme_catalogue 
+                         if START_DATE <= icme['start'] <= END_DATE]
+        print(f"    ✓ {len(icme_catalogue)} ICMEs in date range {START_DATE:%Y-%m-%d} to {END_DATE:%Y-%m-%d}")
+
     print("\nBuilding DRO constellation...")
     constellation = DROConstellation(eccentricity=ECCENTRICITY)
     print("Constellation ready (3 sats).")
@@ -2200,6 +2635,7 @@ def main():
             all_events["Solar Orbiter"],
             spacecraft_data["Solar Orbiter"],
             START_DATE,
+            icme_catalogue,  # Pass ICME catalogue here
             window_hours=INSITU_WINDOW_HR
         )
 
@@ -2220,3 +2656,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
