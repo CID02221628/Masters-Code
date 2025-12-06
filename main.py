@@ -1,5 +1,3 @@
-
-
 import os
 import re
 import warnings
@@ -15,10 +13,65 @@ import pyspedas
 import cdflib
 from scipy.interpolate import interp1d
 from tqdm import tqdm
+import requests
+from io import StringIO
+
+try:
+    from sunpy.coordinates import get_horizons_coord
+    from astropy.time import Time
+    import astropy.units as u
+    SUNPY_AVAILABLE = True
+except ImportError:
+    SUNPY_AVAILABLE = False
+    print("Warning: SunPy not available. Spacecraft ephemerides will not be loaded.")
+
 
 warnings.filterwarnings("ignore")
 
-# ---------------------- Basic timeout + time helpers ---------------------- #
+# ---------------------------- Utilities --------------------------- #
+
+def setup_output_folder():
+    """
+    Prompt user for output folder name and create it.
+    Returns the full path to the output folder.
+    """
+    if not SAVE_PLOTS_TO_FILE:
+        return None
+    
+    print("\n" + "="*80)
+    print("PLOT SAVE SETUP")
+    print("="*80)
+    print(f"Root directory: {FIGURES_ROOT}")
+    print("\nPlots will be saved to a subfolder within the root directory.")
+    
+    while True:
+        folder_name = input("\nEnter folder name for this run: ").strip()
+        
+        if not folder_name:
+            print("Error: Folder name cannot be empty. Please try again.")
+            continue
+        
+        # Remove any path separators to ensure it's just a folder name
+        folder_name = folder_name.replace('/', '_').replace('\\', '_')
+        
+        full_path = os.path.join(FIGURES_ROOT, folder_name)
+        
+        # Check if folder already exists
+        if os.path.exists(full_path):
+            overwrite = input(f"Warning: Folder '{folder_name}' already exists. Overwrite? (y/n): ").strip().lower()
+            if overwrite == 'y':
+                break
+            else:
+                continue
+        else:
+            break
+    
+    # Create the folder
+    os.makedirs(full_path, exist_ok=True)
+    print(f"\n✓ Created output folder: {full_path}")
+    print("="*80 + "\n")
+    
+    return full_path
 
 class TimeoutError(Exception):
     pass
@@ -73,8 +126,6 @@ def ensure_datetime_array(times):
                 out.append(datetime(1970, 1, 1))
     return np.array(out, dtype=object)
 
-# -------------------------- Debug + cleaning helpers ---------------------- #
-
 def _dbg_stats(name, arr, units="", expected_min=None, expected_max=None):
     arr = np.asarray(arr, dtype=float).ravel()
     finite = arr[np.isfinite(arr)]
@@ -100,18 +151,6 @@ def _dbg_stats(name, arr, units="", expected_min=None, expected_max=None):
                   f"{bad_low} below {expected_min} {units}, "
                   f"{bad_high} above {expected_max} {units}")
 
-# ------------------------------ SunPy import ------------------------------ #
-
-try:
-    from sunpy.coordinates import get_horizons_coord
-    from astropy.time import Time
-    import astropy.units as u
-    SUNPY_AVAILABLE = True
-except ImportError:
-    SUNPY_AVAILABLE = False
-    print("Warning: SunPy not available. Spacecraft ephemerides will not be loaded.")
-
-# ------------------------------- Matplotlib ------------------------------- #
 
 plt.rcParams.update({
     "font.family": "serif",
@@ -128,36 +167,46 @@ plt.rcParams.update({
     "grid.alpha": 0.25,
 })
 
-# ------------------------------ Constants -------------------------------- #
+# ---------------------------- Constants & Toggles --------------------------- #
 
-AU_KM            = 1.496e8
-YEAR_DAYS        = 365.25
-MEAN_MOTION      = 2 * np.pi / YEAR_DAYS
+AU_KM = 1.496e8
+YEAR_DAYS = 365.25
+MEAN_MOTION = 2 * np.pi / YEAR_DAYS
 
-START_DATE       = datetime(2018, 1, 1)
-END_DATE         = datetime(2024, 12, 31)
-ECCENTRICITY     = 0.10
-SUN_EARTH_TOL_AU = 0.1
-DRO_TOL_AU       = 0.55
-DT_HOURS         = 6
+START_DATE = datetime(2006, 1, 1)
+END_DATE = datetime(2024, 12, 31)
+ECCENTRICITY = 0.10
+SUN_EARTH_TOL_AU= 0.1
+DRO_TOL_AU = 0.2
+DT_HOURS = 6
 INSITU_WINDOW_HR = 120  # ± 5 days
 
 # target cadence for MAG decimation (~1 point per minute per day-file)
 MAG_TARGET_POINTS_PER_DAY = 1440
 
-PLOT_OVERVIEW          = True
-PLOT_HELIOCENTRIC      = True
-PLOT_EARTH_FRAME       = True
-PLOT_INSITU_DST        = True
+PLOT_ONLY_ICME_EVENTS = False 
+
+PLOT_OVERVIEW = True
+PLOT_HELIOCENTRIC = True
+PLOT_EARTH_FRAME = True
+PLOT_INSITU_DST = True
+
+FILTER_SUNWARD_ONLY = True  
+SAVE_PLOTS_TO_FILE = False 
+
+FIGURES_ROOT = '/Users/henryhodges/Documents/Year 4/Masters/Code/figures'
 
 EVENT_LIMIT = {
-    "STEREO-A":      None,
+    "STEREO-A": None,
     "Solar Orbiter": None,
+    "Parker Solar Probe": None,
+    "STEREO-B": None,
 }
 
-WRITE_EVENTS_CSV   = True
-CSV_FILENAME       = "henon_dro_crossover_events.csv"
+WRITE_EVENTS_CSV = True
+CSV_FILENAME = "henon_dro_crossover_events.csv"
 TRACK_CONTEXT_DAYS = 42
+
 
 # ------------------------------ Orbit model ------------------------------ #
 
@@ -222,7 +271,6 @@ class HenonDRO:
             "dro_earth":   dro_earth,
         }
 
-
 class DROConstellation:
     def __init__(self, eccentricity=0.10):
         self.e = eccentricity
@@ -241,11 +289,16 @@ class DROConstellation:
 class SpacecraftData:
     HORIZONS_IDS = {
         "STEREO-A":      "-234",
+        "STEREO-B":      "-235",
         "Solar Orbiter": "-144",
+        "Parker Solar Probe": "-96",
     }
 
     @staticmethod
     def get_positions(spacecraft_name, start_date, end_date, dt_hours=6):
+        """
+        Check coordinate system for STEREO spacecraft
+        """
         if not SUNPY_AVAILABLE:
             return None
         if spacecraft_name not in SpacecraftData.HORIZONS_IDS:
@@ -296,7 +349,6 @@ class SpacecraftData:
 
 
 class SunEarthLineAnalyzer:
-    
     @staticmethod
     def earth_position_at_time(time_dt, epoch_dt):
         days  = (time_dt - epoch_dt).total_seconds() / 86400
@@ -348,11 +400,36 @@ class CrossoverFinder:
         return events
 
     def group_events_by_day(self, events):
+        """
+        Group events by week and select best event per week.
+        Now includes filtering for physically meaningful events.
+        """
         if not events:
             return []
+        
+        # Sort by time
         events.sort(key=lambda x: x["time"])
+        
+        print(f"\n[FILTER] Starting with {len(events)} raw crossover detections")
+        
+        # =========================================================================
+        # FILTER 1: Only keep sunward events (spacecraft between Sun and Earth)
+        # =========================================================================
+        if FILTER_SUNWARD_ONLY:
+            sunward_events = [e for e in events if e["is_between_sun_earth"]]
+            print(f"[FILTER] After sunward filter: {len(sunward_events)} events")
+            print(f"         (removed {len(events) - len(sunward_events)} events behind Earth or beyond Sun)")
+            events = sunward_events
+        
+        if not events:
+            print("[FILTER] No events remaining after filters")
+            return []
+        
+        # =========================================================================
+        # Group by week and select best event per week
+        # =========================================================================
         groups = []
-        cur    = [events[0]]
+        cur = [events[0]]
         for e in events[1:]:
             if (e["time"] - cur[0]["time"]).days < 7:
                 cur.append(e)
@@ -361,13 +438,18 @@ class CrossoverFinder:
                 cur = [e]
         if cur:
             groups.append(cur)
+        
+        # Select best (closest to DRO) from each group
         best = [min(g, key=lambda x: x["dist_to_dro_au"]) for g in groups]
+        
+        print(f"[FILTER] After weekly grouping: {len(best)} unique events")
+        print(f"         (consolidated {len(events)} detections into {len(best)} weekly events)")
+        
         return best
 
 # ------------------------- L1 OMNI loader + ballistic -------------------- #
 
 class L1DataLoader:
-    
     @staticmethod
     def load_omni_data(t0_dt, t1_dt):
         """
@@ -605,7 +687,6 @@ class L1DataLoader:
 
 
 class BallisticPropagation:
-    
     @staticmethod
     def calculate_propagation_delay(sc_pos, l1_pos, v_sw):
         delta_r = l1_pos - sc_pos
@@ -703,12 +784,11 @@ class BallisticPropagation:
             return None
         return result
 
-
 # ------------------------------ ICME Catalogue --------------------------- #
 
-class ICMECatalogue:   
+class CME_Catalogue:   
     @staticmethod
-    def load_richardson_cane():
+    def load_catalouge():
         """
         Load Richardson & Cane ICME catalogue from web.
         Returns list of ICME events with start/end times, or None on failure.
@@ -718,49 +798,33 @@ class ICMECatalogue:
         url = "http://www.srl.caltech.edu/ACE/ASC/DATA/level3/icmetable2.htm"
         
         try:
-            import requests
-            from io import StringIO
-            
-            # Download with proper encoding
-            print(f"    Downloading from {url}")
+            #HTML nonsense
             response = requests.get(url, timeout=30)
             response.raise_for_status()
-            
-            # Use cp775 encoding (not UTF-8)
             html_content = response.content.decode('cp775')
-            print(f"    ✓ Downloaded {len(html_content)} characters")
-            
-            # Parse with pandas using StringIO
+
+            #change to string to let pandas read it 
             dfs = pd.read_html(StringIO(html_content))
             
             if not dfs:
-                print("    ❌ No tables found")
                 return None
             
             df = dfs[0]
-            print(f"    ✓ Found table with {len(df)} rows")
-            
-            # Parse the table
-            icme_list = ICMECatalogue._parse_richardson_cane_table(df)
+            icme_list = CME_Catalogue._parse_catalouge(df)
             
             if icme_list:
-                print(f"    ✓ Parsed {len(icme_list)} ICME events")
+                print(f"Parsed {len(icme_list)} ICME events")
                 return icme_list
             else:
-                print("    ⚠️  Parsing failed - no events extracted")
+                print("Parsing failed - no events extracted")
                 return None
                 
         except Exception as e:
-            print(f"    ❌ Failed to download/parse catalogue: {e}")
-            print("\n    MANUAL WORKAROUND:")
-            print("    1. Visit: http://www.srl.caltech.edu/ACE/ASC/DATA/level3/icmetable2.htm")
-            print("    2. Save the page as 'icme_catalogue.html'")
-            print("    3. Place it in the working directory")
-            print("    4. Re-run the script")
+            print(f"Failed to download/parse catalogue: {e}")
             return None
     
     @staticmethod
-    def _parse_richardson_cane_table(df):
+    def _parse_catalouge(df):
         """
         Parse Richardson & Cane ICME table from DataFrame.
         
@@ -775,7 +839,7 @@ class ICMECatalogue:
         # 0: Disturbance time
         # 1: ICME start
         # 2: ICME end
-        # 14: MC flag (1/2/3 = MC, else = Ejecta)
+        # 14: Magnetic cloud confidence (1/2/3 = MC, else = Nope)
         
         for idx, row in df.iterrows():
             try:
@@ -791,7 +855,7 @@ class ICMECatalogue:
                 if start_str == 'nan' or end_str == 'nan' or start_str == '...' or end_str == '...':
                     continue
                 
-                # Parse datetime: format is "YYYY/MM/DD HHMM"
+                # Parse datetime (format is "YYYY/MM/DD HHMM")
                 start_dt = datetime.strptime(start_str, "%Y/%m/%d %H%M")
                 end_dt = datetime.strptime(end_str, "%Y/%m/%d %H%M")
                 
@@ -845,7 +909,7 @@ class ICMECatalogue:
             df = dfs[0]
             print(f"    ✓ Found table with {len(df)} rows")
             
-            icme_list = ICMECatalogue._parse_richardson_cane_table(df)
+            icme_list = CME_Catalogue._parse_catalouge(df)
             
             if icme_list:
                 print(f"    ✓ Parsed {len(icme_list)} ICME events")
@@ -1228,18 +1292,14 @@ class SoloDataLoader:
             or None on failure.
         """
         try:
-            trange = [
-                t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                t1_dt.strftime("%Y-%m-%d/%H:%M:%S")
-            ]
+            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"), t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
 
-            # Download files (this part works)
             files = pyspedas.projects.solo.swa(
                 trange=trange,
                 datatype="pas-eflux",
                 level="l2",
                 time_clip=True,
-                downloadonly=True  # Just download, don't try to load
+                downloadonly=True
             )
             
             if not files:
@@ -1258,17 +1318,13 @@ class SoloDataLoader:
                     continue
                 
                 try:
-                    # Read variables directly from CDF
                     epoch = cdf.varget('Epoch')
                     times_dt = cdflib.cdfepoch.to_datetime(epoch)
+                    eflux_data = cdf.varget('eflux')
                     
-                    eflux_data = cdf.varget('eflux')  # Shape: [ntimes, nenergies]
-                    
-                    # Get energy bins (should be same for all files, so just grab once)
                     if energy_bins is None:
                         energy_bins = cdf.varget('Energy')
                     
-                    # Accumulate data
                     all_times.extend(times_dt)
                     all_eflux.extend(eflux_data)
                     
@@ -1280,11 +1336,9 @@ class SoloDataLoader:
                 print("    [EFLUX] No data read from files")
                 return None
 
-            # Convert to arrays
             times_array = ensure_datetime_array(all_times)
             eflux_array = np.array(all_eflux, dtype=float)
             
-            # Sort by time
             sort_idx = np.argsort([t.timestamp() for t in times_array])
             times_array = times_array[sort_idx]
             eflux_array = eflux_array[sort_idx]
@@ -1300,7 +1354,7 @@ class SoloDataLoader:
         except Exception as e:
             print(f"    [EFLUX] error: {e}")
             return None
-        
+    
     @staticmethod
     def load_kyoto_dst(t0_dt, t1_dt):
         """
@@ -1835,7 +1889,7 @@ class SoloDataLoader:
             icmes = None
             if icme_catalogue:
                 print(f"\n[PRELOAD] Checking ICME catalogue for event at {t_ev}")
-                icmes = ICMECatalogue.backpropagate_icmes(
+                icmes = CME_Catalogue.backpropagate_icmes(
                     event, spacecraft_ephemeris, epoch_date, icme_catalogue,
                     common_data=common
                 )
@@ -1867,28 +1921,541 @@ class SoloDataLoader:
 
         return all_data
 
+# ------------------------ STEREO in-situ loaders -------------------------- #
+
+class STEREODataLoader:
+    """Data loader for STEREO-A and STEREO-B spacecraft."""
+    
+    @staticmethod
+    def load_mag(spacecraft, t0_dt, t1_dt):
+        """
+        Load STEREO IMPACT MAG data with decimation.
+        
+        Args:
+            spacecraft: "STEREO-A" or "STEREO-B"
+            t0_dt: Start datetime
+            t1_dt: End datetime
+            
+        Returns:
+            {"time": datetime array, "B": [N×3] RTN B-field} or None
+        """
+        try:
+            probe = 'a' if spacecraft == "STEREO-A" else 'b'
+            
+            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
+                     t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+            
+            # Download files (no level/coord args for STEREO)
+            files = pyspedas.projects.stereo.mag(trange=trange,probe=probe,time_clip=True,downloadonly=True)
+            
+            if not files:
+                print(f"    [DBG] {spacecraft} MAG: no files returned")
+                return None
+            
+            all_times = []
+            all_B = []
+            
+            for cdf_file in files:
+                cdf = safe_cdf_read(cdf_file)
+                if not cdf:
+                    continue
+                
+                try:
+                    vars_list = cdf.cdf_info().zVariables
+                    
+                    # STEREO variable names
+                    epoch_var = next((v for v in ['Epoch', 'EPOCH', 'epoch'] if v in vars_list), None)
+                    b_var = next((v for v in ['BFIELD', 'B_RTN', 'BRTN'] if v in vars_list), None)
+                    
+                    if not epoch_var or not b_var:
+                        continue
+                    
+                    epoch = cdf.varget(epoch_var)
+                    b_data = cdf.varget(b_var)
+                    
+                    n = len(epoch)
+                    if n == 0:
+                        continue
+                    
+                    # Decimate per file
+                    step = max(1, n // MAG_TARGET_POINTS_PER_DAY)
+                    idx = np.arange(0, n, step, dtype=int)
+                    
+                    epoch_sel = epoch[idx]
+                    b_sel = b_data[idx, :] if b_data.ndim > 1 else b_data[idx]
+                    
+                    times_dt = cdflib.cdfepoch.to_datetime(epoch_sel)
+                    all_times.extend(times_dt)
+                    all_B.append(b_sel)
+                    
+                    # Per-file debug
+                    if b_sel.ndim == 1:
+                        bmag = np.abs(b_sel)
+                    else:
+                        bmag = np.linalg.norm(b_sel, axis=1)
+                    print(f"      [DBG] {spacecraft} MAG {os.path.basename(cdf_file)}: "
+                          f"{n}→{len(epoch_sel)} pts, |B| range {np.nanmin(bmag):.2f}–{np.nanmax(bmag):.2f} nT")
+                
+                except Exception as e:
+                    print(f"    Err {spacecraft} MAG {os.path.basename(cdf_file)}: {e}")
+                    continue
+            
+            if not all_B:
+                print(f"    [DBG] {spacecraft} MAG: all_B empty after reading files")
+                return None
+            
+            B_combined = np.vstack(all_B).astype(float)
+            times_arr = ensure_datetime_array(all_times)
+
+            if B_combined.ndim == 2 and B_combined.shape[1] == 4:
+                print(f"    [DBG] {spacecraft} MAG: Detected 4-column format [Br,Bt,Bn,|B|], using first 3")
+                B_combined = B_combined[:, :3] 
+
+            mask_bad = (
+                (~np.isfinite(B_combined)) |
+                (np.abs(B_combined) >= 1e30) |
+                (np.abs(B_combined) > 500.0)
+            )
+            B_combined[mask_bad] = np.nan
+            
+            sort_idx = np.argsort([t.timestamp() for t in times_arr])
+            times_arr = times_arr[sort_idx]
+            B_combined = B_combined[sort_idx]
+            
+
+            if B_combined.ndim == 1:
+                Bmag = np.abs(B_combined)
+            else:
+                Bmag = np.linalg.norm(B_combined, axis=1)
+            
+            print(f"    ✓ {spacecraft} MAG (decimated): {len(times_arr)} pts, B shape={B_combined.shape}")
+            print(f"    [DBG] {spacecraft} MAG combined |B| range: {np.nanmin(Bmag):.2f}–{np.nanmax(Bmag):.2f} nT")
+            
+            if np.nanmax(Bmag) > 1e3:
+                print(f"    [WARN] {spacecraft} MAG |B| > 1000 nT -> units/scale suspect.")
+            
+            return {"time": times_arr, "B": B_combined}
+        
+        except Exception as e:
+            print(f"    {spacecraft} MAG error: {e}")
+            return None
+    
+    @staticmethod
+    def load_plasma(spacecraft, t0_dt, t1_dt):
+        """
+        Load STEREO PLASTIC plasma moments (L2 1-min).
+        
+        Args:
+            spacecraft: "STEREO-A" or "STEREO-B"
+            t0_dt: Start datetime
+            t1_dt: End datetime
+            
+        Returns:
+            {"time": datetime array, "n": density, "V": [N×3] velocity, "T": temperature} or None
+        """
+        try:
+            probe = 'a' if spacecraft == "STEREO-A" else 'b'
+            
+            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
+                     t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+            
+            files = pyspedas.projects.stereo.plastic(
+                trange=trange,
+                probe=probe,
+                time_clip=True,
+                downloadonly=True
+            )
+            
+            if not files:
+                print(f"    [DBG] {spacecraft} PLASTIC: no files returned")
+                return None
+            
+            print(f"    Reading {len(files)} PLASTIC files...")
+            all_times = []
+            all_n = []
+            all_V = []
+            all_T = []
+            
+            for cdf_file in files:
+                cdf = safe_cdf_read(cdf_file)
+                if not cdf:
+                    continue
+                
+                try:
+                    vars_list = cdf.cdf_info().zVariables
+                    
+                    epoch_var = next((v for v in ['epoch', 'Epoch', 'EPOCH'] if v in vars_list), None)
+                    if not epoch_var:
+                        continue
+                    
+                    epoch = cdf.varget(epoch_var)
+                    times_dt = cdflib.cdfepoch.to_datetime(epoch)
+                    
+                    n_data = None
+                    for n_var in ['proton_number_density', 'Np', 'N']:
+                        if n_var in vars_list:
+                            try:
+                                n_data = cdf.varget(n_var)
+                                break
+                            except:
+                                continue
+                    
+                    v_data = None
+                    for v_var in ['proton_bulk_speed', 'Vp_RTN', 'Vp', 'V']:
+                        if v_var in vars_list:
+                            try:
+                                v_data = cdf.varget(v_var)
+                                if v_data.ndim == 1:
+                                    v_data = np.column_stack([v_data, np.zeros(len(v_data)), np.zeros(len(v_data))])
+                                break
+                            except:
+                                continue
+                    
+                    t_data = None
+                    for t_var in ['proton_temperature', 'Tp', 'T']:
+                        if t_var in vars_list:
+                            try:
+                                t_data = cdf.varget(t_var)
+                                break
+                            except:
+                                continue
+                    
+                    if n_data is not None or v_data is not None or t_data is not None:
+                        all_times.extend(times_dt)
+                        all_n.extend(n_data if n_data is not None else [np.nan] * len(times_dt))
+                        all_V.extend(v_data if v_data is not None else [[np.nan, np.nan, np.nan]] * len(times_dt))
+                        all_T.extend(t_data if t_data is not None else [np.nan] * len(times_dt))
+                
+                except Exception as e:
+                    print(f"    Err {spacecraft} PLASTIC {os.path.basename(cdf_file)}: {e}")
+                    continue
+            
+            if not all_times:
+                print(f"    [DBG] {spacecraft} PLASTIC: no data read from files")
+                return None
+            
+            times_arr = ensure_datetime_array(all_times)
+            n_arr = np.array(all_n, dtype=float)
+            v_arr = np.array(all_V, dtype=float)
+            t_arr = np.array(all_T, dtype=float)
+            
+            # Clean
+            n_arr[(~np.isfinite(n_arr)) | (n_arr < 0) | (n_arr > 1000)] = np.nan
+            v_arr[(~np.isfinite(v_arr)) | (np.abs(v_arr) > 3000)] = np.nan
+            t_arr[(~np.isfinite(t_arr)) | (t_arr < 0)] = np.nan
+            
+            # Convert Kelvin to eV if needed
+            if np.nanmedian(t_arr) > 1000:
+                print(f"    Converting T: Kelvin → eV")
+                t_arr = t_arr / 11604.5
+            
+            # Sort
+            sort_idx = np.argsort([t.timestamp() for t in times_arr])
+            times_arr = times_arr[sort_idx]
+            n_arr = n_arr[sort_idx]
+            v_arr = v_arr[sort_idx]
+            t_arr = t_arr[sort_idx]
+            
+            print(f"    ✓ {spacecraft} PLASTIC: {len(times_arr)} points")
+            _dbg_stats(f"{spacecraft} n", n_arr, "cm^-3", expected_min=0, expected_max=100)
+            _dbg_stats(f"{spacecraft} |V|", np.linalg.norm(v_arr, axis=1), "km/s", 
+                      expected_min=0, expected_max=1000)
+            _dbg_stats(f"{spacecraft} T", t_arr, "eV", expected_min=0, expected_max=500)
+            
+            return {
+                "time": times_arr,
+                "n": n_arr,
+                "V": v_arr,
+                "T": t_arr
+            }
+        
+        except Exception as e:
+            print(f"    {spacecraft} PLASTIC error: {e}")
+            return None
+    
+    @staticmethod
+    def load_eflux(spacecraft, t0_dt, t1_dt):
+        """
+        Attempt to load STEREO PLASTIC energy flux spectrogram.
+        Note: STEREO PLASTIC L2 may not contain full eflux spectrograms.
+        
+        Returns:
+            {"time": datetime array, "eflux": [N×E] array, "energy": energy bins} or None
+        """
+        try:
+            probe = 'a' if spacecraft == "STEREO-A" else 'b'
+            
+            trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
+                     t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+            
+            files = pyspedas.projects.stereo.plastic(
+                trange=trange,
+                probe=probe,
+                time_clip=True,
+                downloadonly=True
+            )
+            
+            if not files:
+                return None
+            
+            print(f"    Reading {len(files)} PLASTIC files for eflux...")
+            all_times = []
+            all_eflux = []
+            energy_bins = None
+            
+            for cdf_file in files:
+                cdf = safe_cdf_read(cdf_file)
+                if not cdf:
+                    continue
+                
+                try:
+                    vars_list = cdf.cdf_info().zVariables
+                    
+                    # Look for eflux-like variables
+                    eflux_var = None
+                    for candidate in ['eflux', 'EFLUX', 'diff_en_fluxes', 'energy_flux']:
+                        if candidate in vars_list:
+                            eflux_var = candidate
+                            break
+                    
+                    if eflux_var:
+                        epoch_var = next((v for v in ['epoch', 'Epoch', 'EPOCH'] if v in vars_list), None)
+                        if not epoch_var:
+                            continue
+                        
+                        epoch = cdf.varget(epoch_var)
+                        times_dt = cdflib.cdfepoch.to_datetime(epoch)
+                        eflux_data = cdf.varget(eflux_var)
+                        
+                        # Try to get energy bins
+                        if energy_bins is None:
+                            for e_var in ['energy', 'Energy', 'ENERGY', 'energy_vals']:
+                                if e_var in vars_list:
+                                    try:
+                                        energy_bins = cdf.varget(e_var)
+                                        break
+                                    except:
+                                        continue
+                        
+                        all_times.extend(times_dt)
+                        all_eflux.append(eflux_data)
+                
+                except Exception:
+                    continue
+            
+            if not all_times or not all_eflux:
+                print(f"    [DBG] {spacecraft} EFLUX: not found in PLASTIC L2 files")
+                return None
+            
+            times_arr = ensure_datetime_array(all_times)
+            eflux_arr = np.vstack(all_eflux).astype(float)
+            
+            # Sort by time
+            sort_idx = np.argsort([t.timestamp() for t in times_arr])
+            times_arr = times_arr[sort_idx]
+            eflux_arr = eflux_arr[sort_idx]
+            
+            print(f"    ✓ {spacecraft} EFLUX: {len(times_arr)} times × {eflux_arr.shape[1]} energies")
+            
+            return {
+                "time": times_arr,
+                "eflux": eflux_arr,
+                "energy": energy_bins if energy_bins is not None else np.logspace(2, 4, eflux_arr.shape[1])
+            }
+        
+        except Exception as e:
+            print(f"    {spacecraft} EFLUX error: {e}")
+            return None
+    
+    @staticmethod
+    def interpolate_to_mag_time(mag_data, plasma_data):
+        """
+        Interpolate PLASTIC moments to MAG times.
+        Same logic as SoloDataLoader.interpolate_to_mag_time()
+        """
+        mag_t = np.array([t.timestamp() for t in mag_data["time"]])
+        plasma_t = np.array([t.timestamp() for t in plasma_data["time"]])
+        
+        if mag_t.size == 0 or plasma_t.size == 0:
+            print("    [DBG] interpolate_to_mag_time: empty time arrays")
+            return None
+        
+        if mag_t[0] > plasma_t[-1] or mag_t[-1] < plasma_t[0]:
+            print("    [DBG] interpolate_to_mag_time: no time overlap between MAG and PLASTIC")
+            return None
+        
+        print(f"    [DBG] interpolate_to_mag_time:"
+              f" MAG {len(mag_t)} pts ({datetime.utcfromtimestamp(mag_t[0])} → {datetime.utcfromtimestamp(mag_t[-1])}),"
+              f" PLASTIC {len(plasma_t)} pts ({datetime.utcfromtimestamp(plasma_t[0])} → {datetime.utcfromtimestamp(plasma_t[-1])})")
+        
+        V_interp = np.zeros((len(mag_t), 3))
+        for i in range(3):
+            f = interp1d(plasma_t, plasma_data["V"][:, i], kind="linear",
+                        bounds_error=False, fill_value=np.nan)
+            V_interp[:, i] = f(mag_t)
+        
+        f_n = interp1d(plasma_t, plasma_data["n"], kind="linear",
+                      bounds_error=False, fill_value=np.nan)
+        n_interp = f_n(mag_t)
+        
+        valid = ~(np.isnan(V_interp).any(axis=1) | np.isnan(n_interp))
+        if not valid.any():
+            print("    [DBG] interpolate_to_mag_time: no valid points after interpolation (all NaN)")
+            return None
+        
+        mag_times_valid = [mag_data["time"][i] for i in range(len(mag_t)) if valid[i]]
+        B_valid = mag_data["B"][valid]
+        V_valid = V_interp[valid]
+        n_valid = n_interp[valid]
+        
+        # Debug ranges
+        if B_valid.ndim == 1:
+            Bmag = np.abs(B_valid)
+        else:
+            Bmag = np.linalg.norm(B_valid, axis=1)
+        Vmag = np.linalg.norm(V_valid, axis=1)
+        
+        print(f"    [DBG] common (MAG+PLASTIC) points: {len(mag_times_valid)}")
+        print(f"    [DBG] MAG |B| range on common grid: {np.nanmin(Bmag):.2f}–{np.nanmax(Bmag):.2f} nT")
+        print(f"    [DBG] PLASTIC V_mag range on MAG grid: {np.nanmin(Vmag):.1f}–{np.nanmax(Vmag):.1f} km/s")
+        print(f"    [DBG] PLASTIC n range on MAG grid: {np.nanmin(n_valid):.2f}–{np.nanmax(n_valid):.2f} cm^-3")
+        
+        if np.nanmax(Vmag) > 2_000:
+            print("    [WARN] PLASTIC V_mag on MAG grid > 2000 km/s -> units suspect.")
+        if np.nanmax(n_valid) > 1_000:
+            print("    [WARN] PLASTIC n on MAG grid > 1000 cm^-3 -> units/flags suspect.")
+        
+        return {
+            "time": mag_times_valid,
+            "B": B_valid,
+            "V": V_valid,
+            "n": n_valid,
+        }
+    
+    @staticmethod
+    def preload_all(spacecraft, events, spacecraft_ephemeris, epoch_date, icme_catalogue, window_hours=72):
+        """
+        Preload all STEREO data for given events.
+        Similar to SoloDataLoader.preload_all() but for STEREO spacecraft.
+        """
+        all_data = {}
+        for event in tqdm(events, desc=f"Loading {spacecraft}", ncols=80):
+            t_ev = event["time"]
+            t0_dt = t_ev - timedelta(hours=window_hours)
+            t1_dt = t_ev + timedelta(hours=window_hours)
+            
+            print(f"\n  {t_ev}:")
+            print(f"    In-situ window: {t0_dt} → {t1_dt}")
+            
+            mag = STEREODataLoader.load_mag(spacecraft, t0_dt, t1_dt)
+            plasma = STEREODataLoader.load_plasma(spacecraft, t0_dt, t1_dt)
+            eflux = STEREODataLoader.load_eflux(spacecraft, t0_dt, t1_dt)
+            
+            ext_t0 = t0_dt
+            ext_t1 = t1_dt + timedelta(days=5)
+            print(f"    Extended window for Dst/Kp/L1: {ext_t0} → {ext_t1}")
+            
+            dst = SoloDataLoader.load_kyoto_dst(ext_t0, ext_t1)
+            kp = SoloDataLoader.load_kp_index(ext_t0, ext_t1)
+            l1 = L1DataLoader.load_omni_data(ext_t0, ext_t1)
+            
+            dst_pred = None
+            dst_shifted = None
+            kp_pred = None
+            kp_shifted = None
+            l1_shifted = None
+            common = None
+            
+            if mag and plasma and ("V" in plasma) and ("n" in plasma):
+                common = STEREODataLoader.interpolate_to_mag_time(mag, plasma)
+                if common:
+                    dst_pred = SoloDataLoader.predict_dst_obrien(
+                        common["B"], common["V"], common["n"], common["time"]
+                    )
+                    dst_shifted = SoloDataLoader.apply_propagation_delay(
+                        common, dst, spacecraft_ephemeris, epoch_date
+                    )
+                    
+                    sc_times_sec = np.array([t.timestamp() for t in spacecraft_ephemeris["times"]])
+                    sc_positions = spacecraft_ephemeris["positions"]
+                    common_times_sec = np.array([t.timestamp() for t in common["time"]])
+                    
+                    sc_pos_interp = np.zeros((len(common_times_sec), 3))
+                    for i in range(3):
+                        f_pos = interp1d(sc_times_sec, sc_positions[:, i],
+                                        kind="linear", bounds_error=False,
+                                        fill_value=np.nan)
+                        sc_pos_interp[:, i] = f_pos(common_times_sec)
+                    
+                    kp_pred = SoloDataLoader.predict_kp_newell(
+                        common["B"], common["V"], common["time"],
+                        sc_pos_interp, epoch_date
+                    )
+                    kp_shifted = SoloDataLoader.apply_propagation_delay_kp(
+                        common, kp, spacecraft_ephemeris, epoch_date
+                    )
+                    
+                    if l1:
+                        l1_shifted = BallisticPropagation.apply_ballistic_shift_to_l1(
+                            common, l1, spacecraft_ephemeris, epoch_date
+                        )
+            
+            # Back-propagate ICMEs
+            icmes = None
+            if icme_catalogue:
+                print(f"\n[PRELOAD] Checking ICME catalogue for event at {t_ev}")
+                icmes = CME_Catalogue.backpropagate_icmes(
+                    event, spacecraft_ephemeris, epoch_date, icme_catalogue,
+                    common_data=common
+                )
+                if icmes:
+                    print(f"    ✓ Matched {len(icmes)} ICME(s)")
+                    for i, icme in enumerate(icmes, 1):
+                        print(f"      {i}. Earth: {icme['earth_start'].strftime('%b %d %H:%M')} → "
+                              f"{icme['earth_end'].strftime('%b %d %H:%M')} ({icme['type']})")
+                        print(f"         S/C:   {icme['sc_start'].strftime('%b %d %H:%M')} → "
+                              f"{icme['sc_end'].strftime('%b %d %H:%M')} "
+                              f"(Δt={icme['propagation_hours']:.1f} hrs)")
+                else:
+                    print(f"    No ICMEs matched")
+            
+            all_data[t_ev] = {
+                "mag": mag,
+                "swa": eflux,  # Store eflux in same key for compatibility
+                "swa_moments": plasma,
+                "dst_measured": dst,
+                "dst_predicted": dst_pred,
+                "dst_shifted": dst_shifted,
+                "kp_measured": kp,
+                "kp_predicted": kp_pred,
+                "kp_shifted": kp_shifted,
+                "l1_data": l1,
+                "l1_shifted": l1_shifted,
+                "icmes": icmes,
+            }
+        
+        return all_data
+    
 # ------------------------------- Plotting -------------------------------- #
 
 class Plotter:
+
     @staticmethod
-    def plot_constellation_overview(events, constellation):
+    def plot_constellation_overview(events, constellation, output_folder=None):
         fig, ax = plt.subplots(figsize=(12, 12))
         ax.set_aspect("equal")
 
-        ax.plot(0, 0, "o", ms=16, color="#FDB813", mec="#F37021", mew=2,
-                label="Sun", zorder=10)
+        ax.plot(0, 0, "o", ms=16, color="#FDB813", mec="#F37021", mew=2, label="Sun", zorder=10)
 
         theta = np.linspace(0, 2 * np.pi, 1000)
-        ax.plot(np.cos(theta), np.sin(theta), "b--", lw=1.5, alpha=0.4,
-                label="Earth orbit")
+        ax.plot(np.cos(theta), np.sin(theta), "b--", lw=1.5, alpha=0.4, label="Earth orbit")
 
         colors = ["#E74C3C", "#3498DB", "#2ECC71"]
         for i, sat in enumerate(constellation.satellites):
             orbit = sat["orbit"]["dro_helio"] / AU_KM
-            ax.plot(orbit[:, 0], orbit[:, 1], color=colors[i], lw=2, alpha=0.7,
-                    label=f"DRO-{sat['id']} ({sat['rotation_deg']}°)")
+            ax.plot(orbit[:, 0], orbit[:, 1], color=colors[i], lw=2, alpha=0.7, label=f"DRO-{sat['id']} ({sat['rotation_deg']}°)")
 
-        sc_colors  = {"STEREO-A": "#FF6B6B", "Solar Orbiter": "#45B7D1"}
+        sc_colors = {"STEREO-A": "#FF6B6B", "STEREO-B": "#9B59B6", "Solar Orbiter": "#45B7D1"}
         plotted_sc = set()
 
         for sc_name, sc_events in events.items():
@@ -1899,14 +2466,10 @@ class Plotter:
                 label = sc_name if sc_name not in plotted_sc else None
                 plotted_sc.add(sc_name)
                 pos = ev["spacecraft_pos"][:2] / AU_KM
-                ax.plot(pos[0], pos[1], "o", ms=8, color=color, mec="white", mew=1.5,
-                        alpha=0.9, label=label)
+                ax.plot(pos[0], pos[1], "o", ms=8, color=color, mec="white", mew=1.5, alpha=0.9, label=label)
                 text = f"{ev['time'].strftime('%Y-%m-%d')}\nDRO-{ev['dro_id']}"
-                ax.annotate(text, xy=(pos[0], pos[1]), xytext=(5, 5),
-                            textcoords="offset points",
-                            fontsize=8, alpha=0.8,
-                            bbox=dict(boxstyle="round,pad=0.3",
-                                      facecolor="white", alpha=0.8))
+                ax.annotate(text, xy=(pos[0], pos[1]), xytext=(5, 5), textcoords="offset points", fontsize=8, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
         ax.set_xlim(-1.4, 1.4)
         ax.set_ylim(-1.4, 1.4)
@@ -1916,224 +2479,185 @@ class Plotter:
         ax.legend(loc="upper right", fontsize=10)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
+        
+        if output_folder:
+            filepath = os.path.join(output_folder, "00_constellation_overview.png")
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath}")
+            plt.close(fig)
+        
         return fig
 
     @staticmethod
-    def plot_event_detail(event, spacecraft_name, constellation,
-                        spacecraft_data, epoch_date,
-                        context_days=TRACK_CONTEXT_DAYS):
-        fig, ax1 = plt.subplots(1, 1, figsize=(10, 10))
-        ax1.set_aspect("equal")
+    def plot_event_detail(event, spacecraft_name, constellation, spacecraft_data, epoch_date, context_days=TRACK_CONTEXT_DAYS, output_folder=None):
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        ax.set_aspect("equal")
 
-        dro_sat = None
-        for sat in constellation.satellites:
-            if sat["id"] == event["dro_id"]:
-                dro_sat = sat
-                break
+        dro_sat = next((sat for sat in constellation.satellites if sat["id"] == event["dro_id"]), None)
         if not dro_sat:
             return None
 
         dro_orbit = dro_sat["orbit"]["dro_helio"] / AU_KM
-
-        ax1.plot(0, 0, "o", ms=12, color="#FDB813", mec="#F37021", mew=1.5,
-                label="Sun")
+        ax.plot(0, 0, "o", ms=12, color="#FDB813", mec="#F37021", mew=1.5, label="Sun")
+        
         theta = np.linspace(0, 2 * np.pi, 1000)
-        ax1.plot(np.cos(theta), np.sin(theta), "b--", lw=1, alpha=0.2,
-                label="Earth orbit")
+        ax.plot(np.cos(theta), np.sin(theta), "b--", lw=1, alpha=0.2, label="Earth orbit")
 
         earth_pos = event["earth_pos"] / AU_KM
-        sc_pos    = event["spacecraft_pos"][:2] / AU_KM
-
+        sc_pos = event["spacecraft_pos"][:2] / AU_KM
         half = context_days / 2.0
-        t0   = event["time"] - timedelta(days=half)
-        t1   = event["time"] + timedelta(days=half)
+        t0 = event["time"] - timedelta(days=half)
+        t1 = event["time"] + timedelta(days=half)
 
         times = spacecraft_data["times"]
-        pos   = spacecraft_data["positions"]
-        mask  = [(t0 <= t <= t1) for t in times]
-
+        pos = spacecraft_data["positions"]
+        mask = [(t0 <= t <= t1) for t in times]
         radii = []
 
         if any(mask):
             sc_xy = (pos[mask] / AU_KM)[:, :2]
-            ax1.plot(sc_xy[:, 0], sc_xy[:, 1], "-", lw=2, alpha=0.9, color="#45B7D1",
-                    label=f"{spacecraft_name} (±{half:.0f} d)")
+            ax.plot(sc_xy[:, 0], sc_xy[:, 1], "-", lw=2, alpha=0.9, color="#45B7D1", label=f"{spacecraft_name} (±{half:.0f} d)")
             radii.extend(np.linalg.norm(sc_xy, axis=1).tolist())
 
-            # Plot Earth trajectory
-            earth_xy = []
-            for t in np.array(times)[mask]:
-                epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) / AU_KM
-                earth_xy.append(epos[:2])
-            earth_xy = np.array(earth_xy)
-            ax1.plot(earth_xy[:, 0], earth_xy[:, 1], "-", lw=2, alpha=0.9, color="gold",
-                    label=f"Earth (±{half:.0f} d)")
+            earth_xy = np.array([SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)[:2] / AU_KM for t in np.array(times)[mask]])
+            ax.plot(earth_xy[:, 0], earth_xy[:, 1], "-", lw=2, alpha=0.9, color="gold", label=f"Earth (±{half:.0f} d)")
             radii.extend(np.linalg.norm(earth_xy, axis=1).tolist())
             
-            # NEW: Plot L1 trajectory (0.01 AU sunward from Earth)
             l1_xy = []
             for t in np.array(times)[mask]:
                 epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
-                # L1 is 0.01 AU sunward from Earth along Sun-Earth line
                 earth_sun_dir = -epos / np.linalg.norm(epos)
                 l1_pos = epos + earth_sun_dir * (0.01 * AU_KM)
                 l1_xy.append(l1_pos[:2] / AU_KM)
             l1_xy = np.array(l1_xy)
-            ax1.plot(l1_xy[:, 0], l1_xy[:, 1], "-", lw=2, alpha=0.9, color="lime",
-                    label=f"L1 (±{half:.0f} d)")
+            ax.plot(l1_xy[:, 0], l1_xy[:, 1], "-", lw=2, alpha=0.9, color="lime", label=f"L1 (±{half:.0f} d)")
             radii.extend(np.linalg.norm(l1_xy, axis=1).tolist())
 
-        ax1.plot(dro_orbit[:, 0], dro_orbit[:, 1], "r-", lw=2, alpha=0.7,
-                label=f"DRO-{event['dro_id']}")
+        ax.plot(dro_orbit[:, 0], dro_orbit[:, 1], "r-", lw=2, alpha=0.7, label=f"DRO-{event['dro_id']}")
         radii.extend(np.linalg.norm(dro_orbit[:, :2], axis=1).tolist())
 
-        ax1.plot(earth_pos[0], earth_pos[1], "o", ms=10, color="blue",
-                mec="white", mew=1.5, label="Earth @ event")
-        ax1.plot(sc_pos[0], sc_pos[1], "*", ms=15, color="gold",
-                mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+        ax.plot(earth_pos[0], earth_pos[1], "o", ms=10, color="blue", mec="white", mew=1.5, label="Earth @ event")
+        ax.plot(sc_pos[0], sc_pos[1], "*", ms=15, color="gold", mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
         
-        # NEW: Plot L1 point at event time
         earth_sun_dir = -event["earth_pos"] / np.linalg.norm(event["earth_pos"])
         l1_event = (event["earth_pos"] + earth_sun_dir * (0.01 * AU_KM)) / AU_KM
-        ax1.plot(l1_event[0], l1_event[1], "D", ms=8, color="lime",
-                mec="darkgreen", mew=1.5, label="L1 @ event")
-        
-        ax1.plot([0, earth_pos[0]], [0, earth_pos[1]], "g--", lw=1.5,
-                alpha=0.5, label="Sun–Earth line")
+        ax.plot(l1_event[0], l1_event[1], "D", ms=8, color="lime", mec="darkgreen", mew=1.5, label="L1 @ event")
+        ax.plot([0, earth_pos[0]], [0, earth_pos[1]], "g--", lw=1.5, alpha=0.5, label="Sun–Earth line")
 
-        rmax = max(radii) if radii else max(np.linalg.norm(earth_pos[:2]),
-                                            np.linalg.norm(sc_pos), 1.2)
-        pad  = 0.10 * rmax
-        span = rmax + pad
+        rmax = max(radii) if radii else max(np.linalg.norm(earth_pos[:2]), np.linalg.norm(sc_pos), 1.2)
+        span = rmax + 0.10 * rmax
 
-        ax1.set_xlim(-span, span)
-        ax1.set_ylim(-span, span)
-        ax1.set_xlabel("X [AU]")
-        ax1.set_ylabel("Y [AU]")
-        ax1.set_title(f"{spacecraft_name} — Heliocentric — {event['time'].strftime('%Y-%m-%d')}")
-        ax1.legend(loc="best", fontsize=9)
-        ax1.grid(True, alpha=0.3)
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_xlabel("X [AU]")
+        ax.set_ylabel("Y [AU]")
+        ax.set_title(f"{spacecraft_name} — Heliocentric — {event['time'].strftime('%Y-%m-%d')}")
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.3)
         plt.tight_layout()
+        
+        if output_folder:
+            safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
+            filename = f"helio_{safe_sc_name}_{event['time'].strftime('%Y%m%d')}.png"
+            filepath = os.path.join(output_folder, filename)
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath}")
+            plt.close(fig)
+        
         return fig
 
     @staticmethod
-    def plot_event_detail_earth_frame(event, spacecraft_name,
-                                    constellation, spacecraft_data,
-                                    epoch_date,
-                                    context_days=TRACK_CONTEXT_DAYS):
-        fig, ax1 = plt.subplots(1, 1, figsize=(10, 10))
-        ax1.set_aspect("equal")
+    def plot_event_detail_earth_frame(event, spacecraft_name, constellation, spacecraft_data, epoch_date, context_days=TRACK_CONTEXT_DAYS, output_folder=None):
+        fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+        ax.set_aspect("equal")
 
-        dro_sat = None
-        for sat in constellation.satellites:
-            if sat["id"] == event["dro_id"]:
-                dro_sat = sat
-                break
+        dro_sat = next((sat for sat in constellation.satellites if sat["id"] == event["dro_id"]), None)
         if not dro_sat:
             return None
 
-        dro_1           = constellation.satellites[0]
+        dro_1 = constellation.satellites[0]
         dro_orbit_earth = dro_1["orbit"]["dro_earth"] / AU_KM
 
-        ax1.plot(0, 0, "o", ms=12, color="#4A90E2", mec="white", mew=1.5,
-                label="Earth", zorder=10)
+        ax.plot(0, 0, "o", ms=12, color="#4A90E2", mec="white", mew=1.5, label="Earth", zorder=10)
 
         half = context_days / 2.0
-        t0   = event["time"] - timedelta(days=half)
-        t1   = event["time"] + timedelta(days=half)
+        t0 = event["time"] - timedelta(days=half)
+        t1 = event["time"] + timedelta(days=half)
 
-        times     = spacecraft_data["times"]
+        times = spacecraft_data["times"]
         pos_helio = spacecraft_data["positions"]
-        mask      = [(t0 <= t <= t1) for t in times]
-
+        mask = [(t0 <= t <= t1) for t in times]
         radii = []
 
         if any(mask):
-            # Spacecraft trajectory in Earth frame
             sc_e = []
             for t, pxyz in zip(np.array(times)[mask], pos_helio[mask]):
-                days  = (t - epoch_date).total_seconds() / 86400
+                days = (t - epoch_date).total_seconds() / 86400
                 theta = MEAN_MOTION * days
-                epos  = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
-                rel   = pxyz - epos
-                c, s  = np.cos(-theta), np.sin(-theta)
-                x_e   = rel[0] * c - rel[1] * s
-                y_e   = rel[0] * s + rel[1] * c
+                epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
+                rel = pxyz - epos
+                c, s = np.cos(-theta), np.sin(-theta)
+                x_e = rel[0] * c - rel[1] * s
+                y_e = rel[0] * s + rel[1] * c
                 sc_e.append([x_e, y_e])
             sc_e = np.array(sc_e) / AU_KM
-            ax1.plot(sc_e[:, 0], sc_e[:, 1], "-", lw=2, color="#45B7D1",
-                    alpha=0.9, label=f"{spacecraft_name} (±{half:.0f} d)")
+            ax.plot(sc_e[:, 0], sc_e[:, 1], "-", lw=2, color="#45B7D1", alpha=0.9, label=f"{spacecraft_name} (±{half:.0f} d)")
             radii.extend(np.linalg.norm(sc_e, axis=1).tolist())
             
-            # NEW: L1 trajectory in Earth frame (fixed at ~-0.01 AU on x-axis)
-            # In the rotating Earth frame, L1 is always along the -x axis (toward Sun)
-            l1_e = []
-            for t in np.array(times)[mask]:
-                # In Earth frame, L1 is fixed at -0.01 AU along x-axis
-                l1_e.append([-0.01, 0.0])
-            l1_e = np.array(l1_e)
-            ax1.plot(l1_e[:, 0], l1_e[:, 1], "-", lw=2, color="lime",
-                    alpha=0.9, label=f"L1 (±{half:.0f} d)")
+            l1_e = np.array([[-0.01, 0.0] for _ in range(len(np.array(times)[mask]))])
+            ax.plot(l1_e[:, 0], l1_e[:, 1], "-", lw=2, color="lime", alpha=0.9, label=f"L1 (±{half:.0f} d)")
             radii.extend(np.abs(l1_e[:, 0]).tolist())
 
-        ax1.plot(dro_orbit_earth[:, 0], dro_orbit_earth[:, 1], "r-", lw=2,
-                alpha=0.7, label=f"DRO-{event['dro_id']} ({dro_sat['rotation_deg']}°)")
+        ax.plot(dro_orbit_earth[:, 0], dro_orbit_earth[:, 1], "r-", lw=2, alpha=0.7, label=f"DRO-{event['dro_id']} ({dro_sat['rotation_deg']}°)")
         radii.extend(np.linalg.norm(dro_orbit_earth, axis=1).tolist())
 
-        days_ev  = (event["time"] - epoch_date).total_seconds() / 86400
+        days_ev = (event["time"] - epoch_date).total_seconds() / 86400
         theta_ev = MEAN_MOTION * days_ev
 
-        sc_h    = event["spacecraft_pos"]
-        e_h     = event["earth_pos"]
-        rel_ev  = sc_h - e_h
+        sc_h = event["spacecraft_pos"]
+        e_h = event["earth_pos"]
+        rel_ev = sc_h - e_h
         c_ev, s_ev = np.cos(-theta_ev), np.sin(-theta_ev)
-        sc_x_e  = rel_ev[0] * c_ev - rel_ev[1] * s_ev
-        sc_y_e  = rel_ev[0] * s_ev + rel_ev[1] * c_ev
+        sc_x_e = rel_ev[0] * c_ev - rel_ev[1] * s_ev
+        sc_y_e = rel_ev[0] * s_ev + rel_ev[1] * c_ev
         sc_e_pt = np.array([sc_x_e, sc_y_e]) / AU_KM
 
-        ax1.plot(sc_e_pt[0], sc_e_pt[1], "*", ms=15, color="gold",
-                mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
-        
-        # NEW: L1 point at event time (fixed position in Earth frame)
-        ax1.plot(-0.01, 0.0, "D", ms=8, color="lime",
-                mec="darkgreen", mew=1.5, label="L1 @ event")
+        ax.plot(sc_e_pt[0], sc_e_pt[1], "*", ms=15, color="gold", mec="black", mew=1.5, label=f"{spacecraft_name} @ event")
+        ax.plot(-0.01, 0.0, "D", ms=8, color="lime", mec="darkgreen", mew=1.5, label="L1 @ event")
 
         sun_rel = -e_h
         sun_x_e = sun_rel[0] * c_ev - sun_rel[1] * s_ev
         sun_y_e = sun_rel[0] * s_ev + sun_rel[1] * c_ev
-        sun_e   = np.array([sun_x_e, sun_y_e]) / AU_KM
+        sun_e = np.array([sun_x_e, sun_y_e]) / AU_KM
 
-        ax1.plot(sun_e[0], sun_e[1], "o", ms=14, color="#FDB813",
-                mec="#F37021", mew=2, label="Sun @ event", zorder=9)
+        ax.plot(sun_e[0], sun_e[1], "o", ms=14, color="#FDB813", mec="#F37021", mew=2, label="Sun @ event", zorder=9)
         radii.append(np.linalg.norm(sun_e))
-
-        ax1.plot([0, sun_e[0]], [0, sun_e[1]], "g--", lw=1.5,
-                alpha=0.5, label="Sun–Earth line")
+        ax.plot([0, sun_e[0]], [0, sun_e[1]], "g--", lw=1.5, alpha=0.5, label="Sun–Earth line")
 
         rmax = max(radii) if radii else 1.2
-        pad  = 0.10 * rmax
-        span = rmax + pad
+        span = rmax + 0.10 * rmax
 
-        ax1.set_xlim(-span, span)
-        ax1.set_ylim(-span, span)
-        ax1.set_xlabel("X [AU] (Earth Frame)")
-        ax1.set_ylabel("Y [AU] (Earth Frame)")
-        ax1.set_title(f"{spacecraft_name} — Earth-Centered — {event['time'].strftime('%Y-%m-%d')}")
-        ax1.legend(loc="best", fontsize=9)
-        ax1.grid(True, alpha=0.3)
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_xlabel("X [AU] (Earth Frame)")
+        ax.set_ylabel("Y [AU] (Earth Frame)")
+        ax.set_title(f"{spacecraft_name} — Earth-Centered — {event['time'].strftime('%Y-%m-%d')}")
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.3)
         plt.tight_layout()
+        
+        if output_folder:
+            safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
+            filename = f"earth_{safe_sc_name}_{event['time'].strftime('%Y%m%d')}.png"
+            filepath = os.path.join(output_folder, filename)
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath}")
+            plt.close(fig)
+        
         return fig
 
     @staticmethod
     def _add_icme_shading(axes, icmes, t0, t1):
-        """
-        Add ICME shaded regions to all axes.
-        
-        Args:
-            axes: List of matplotlib axes
-            icmes: List of ICME dicts with sc_start, sc_end, type
-            t0, t1: Time window bounds
-        """
         if not icmes:
             return
         
@@ -2144,383 +2668,374 @@ class Plotter:
             sc_start = np.datetime64(icme['sc_start'])
             sc_end = np.datetime64(icme['sc_end'])
             
-            # Only shade if ICME overlaps with plot window
             if sc_end < np.datetime64(t0) or sc_start > np.datetime64(t1):
                 continue
             
-            # Add shading to all panels except the last (distance/angle)
-            for ax_idx in range(len(axes) - 1):
-                axes[ax_idx].axvspan(sc_start, sc_end, alpha=0.15, color=color, zorder=0)
-                
-                # Add vertical lines at boundaries
-                axes[ax_idx].axvline(sc_start, color=color, linestyle=':', 
-                                    linewidth=1.0, alpha=0.5, zorder=1)
-                axes[ax_idx].axvline(sc_end, color=color, linestyle=':', 
-                                    linewidth=1.0, alpha=0.5, zorder=1)
+            for ax in axes:
+                ax.axvspan(sc_start, sc_end, alpha=0.15, color=color, zorder=0)
+                ax.axvline(sc_start, color=color, linestyle=':', linewidth=1.0, alpha=0.5, zorder=1)
+                ax.axvline(sc_end, color=color, linestyle=':', linewidth=1.0, alpha=0.5, zorder=1)
             
-            # Add label to top panel
             mid_time = sc_start + (sc_end - sc_start) / 2
-            y_pos = axes[0].get_ylim()[1] * (0.95 - i * 0.08)  # Stack labels
-            axes[0].text(mid_time, y_pos, 
-                        f"ICME {i+1}: {icme['type']}", 
-                        ha='center', va='top', fontsize=7,
-                        bbox=dict(boxstyle='round,pad=0.3', 
-                                facecolor='white', alpha=0.7, edgecolor=color))
-            
+            y_pos = axes[0].get_ylim()[1] * (0.95 - i * 0.08)
+            axes[0].text(mid_time, y_pos, f"ICME {i+1}: {icme['type']}", ha='center', va='top', fontsize=7,
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=color))
+
     @staticmethod
-    def plot_solo_insitu_with_dst(event, preloaded, spacecraft_ephemeris, epoch_date, window_hours=INSITU_WINDOW_HR):
+    def plot_solo_insitu_with_dst(event, preloaded, spacecraft_ephemeris, epoch_date, window_hours=INSITU_WINDOW_HR, spacecraft_name="Solar Orbiter", output_folder=None):
+
         center = event.get("time")
         if not isinstance(center, datetime):
-            print("[DBG] plot_solo_insitu_with_dst: event has no valid 'time'")
             return None
 
         d = preloaded.get(center)
         if not d:
-            print(f"[DBG] plot_solo_insitu_with_dst: no preloaded data for {center}")
             return None
 
-        mag          = d.get("mag")
-        swa          = d.get("swa")
-        swa_moments  = d.get("swa_moments")
+        mag = d.get("mag")
+        swa = d.get("swa")
+        swa_moments = d.get("swa_moments")
         dst_measured = d.get("dst_measured")
-        dst_pred     = d.get("dst_predicted")
-        dst_shifted  = d.get("dst_shifted")
-        kp_measured  = d.get("kp_measured")
-        kp_pred      = d.get("kp_predicted")
-        kp_shifted   = d.get("kp_shifted")
-        l1_shifted   = d.get("l1_shifted")
+        dst_pred = d.get("dst_predicted")
+        dst_shifted = d.get("dst_shifted")
+        kp_measured = d.get("kp_measured")
+        kp_pred = d.get("kp_predicted")
+        kp_shifted = d.get("kp_shifted")
+        l1_shifted = d.get("l1_shifted")
+        icmes = d.get("icmes")
 
         if not mag or "time" not in mag or "B" not in mag:
-            print(f"[DBG] plot_solo_insitu_with_dst: MAG missing for {center}")
             return None
 
-        T_mag_full = ensure_datetime_array(mag["time"])
-        B_full     = mag["B"]
+        t_mag_full = ensure_datetime_array(mag["time"])
+        b_full = mag["B"]
 
         t0 = center - timedelta(hours=window_hours)
         t1 = center + timedelta(hours=window_hours)
 
-        mask_mag = (T_mag_full >= t0) & (T_mag_full <= t1)
+        mask_mag = (t_mag_full >= t0) & (t_mag_full <= t1)
         if not np.any(mask_mag):
-            print(f"[DBG] plot_solo_insitu_with_dst: no MAG points in window for {center}")
             return None
 
-        T_mag = T_mag_full[mask_mag]
-        B     = B_full[mask_mag]
+        t_mag = t_mag_full[mask_mag]
+        b = b_full[mask_mag]
 
         max_points = 200_000
-        if len(T_mag) > max_points:
-            step = int(np.ceil(len(T_mag) / float(max_points)))
-            T_mag = T_mag[::step]
-            B     = B[::step]
-            print(f"[DBG] plot_solo_insitu_with_dst: decimated MAG to {len(T_mag)} points (step={step})")
-        else:
-            print(f"[DBG] plot_solo_insitu_with_dst: using {len(T_mag)} MAG points")
+        if len(t_mag) > max_points:
+            step = int(np.ceil(len(t_mag) / float(max_points)))
+            t_mag = t_mag[::step]
+            b = b[::step]
 
-        # CHANGED: 10 rows instead of 9
-        fig = plt.figure(figsize=(14, 24))
         from matplotlib.gridspec import GridSpec
-        gs = GridSpec(10, 1, figure=fig, hspace=0.3)
-        axes = [fig.add_subplot(gs[i, 0]) for i in range(10)]
+        from matplotlib.dates import DateFormatter, AutoDateLocator
 
-        icmes = d.get("icmes")
+
+        # ====================================================================================
+        # PLOT 1: B-FIELD (3 panels)
+        # ====================================================================================
+        
+        fig1 = plt.figure(figsize=(14, 10))
+        gs1 = GridSpec(3, 1, figure=fig1, hspace=0.15)
+        ax_b = [fig1.add_subplot(gs1[i, 0]) for i in range(3)]
+
         if icmes:
-            Plotter._add_icme_shading(axes, icmes, t0, t1)
+            Plotter._add_icme_shading(ax_b, icmes, t0, t1)
 
+        b_labels = ["Br", "Bt", "Bn"]
+        b_colors = ["red", "green", "blue"]
 
-        labels_B = ["Br", "Bt", "Bn"]
-        colors_B = ["red", "green", "blue"]
-
-        for i in range(min(3, B.shape[1])):
-            axes[i].plot(T_mag, B[:, i], linewidth=1.2, color=colors_B[i],
-                        label=f"Solar Orbiter B{labels_B[i]}")
+        for i in range(min(3, b.shape[1])):
+            ax_b[i].plot(t_mag, b[:, i], linewidth=1.2, color=b_colors[i], label=f"{spacecraft_name} B{b_labels[i]}")
+            
             if l1_shifted and "B_gse_shifted" in l1_shifted:
-                B_l1 = l1_shifted["B_gse_shifted"]
-                T_l1_full = ensure_datetime_array(l1_shifted["time"])
-                mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
-                if np.any(mask_l1) and B_l1.shape[1] > i:
-                    T_l1 = T_l1_full[mask_l1]
-                    B_l1_i = B_l1[mask_l1, i]
-                    axes[i].plot(T_l1, B_l1_i, linewidth=1.0,
-                                color=colors_B[i], linestyle='--', alpha=0.7,
-                                label=f"L1 B{labels_B[i]} (shifted)")
-            axes[i].set_ylabel(f"B{labels_B[i]} [nT]")
-            axes[i].grid(True, alpha=0.3)
-            axes[i].legend(loc="upper right", fontsize=8)
-            axes[i].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
+                b_l1 = l1_shifted["B_gse_shifted"]
+                t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+                if np.any(mask_l1) and b_l1.shape[1] > i:
+                    t_l1 = t_l1_full[mask_l1]
+                    b_l1_i = b_l1[mask_l1, i]
+                    ax_b[i].plot(t_l1, b_l1_i, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label=f"L1 B{b_labels[i]} (shifted)")
+            
+            ax_b[i].set_ylabel(f"B{b_labels[i]} [nT]", fontsize=11)
+            ax_b[i].grid(True, alpha=0.3)
+            ax_b[i].legend(loc="upper right", fontsize=8)
+            ax_b[i].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
 
-        # EFLUX PANEL (panel 3)
+        ax_b[-1].set_xlabel("Time (UTC)", fontsize=11)
+        locator = AutoDateLocator()
+        formatter = DateFormatter("%Y-%b-%d\n%H:%M")
+        ax_b[-1].xaxis.set_major_locator(locator)
+        ax_b[-1].xaxis.set_major_formatter(formatter)
+        ax_b[-1].set_xlim(t_mag[0], t_mag[-1])
+        
+        for i in range(2):
+            ax_b[i].sharex(ax_b[2])
+            ax_b[i].tick_params(labelbottom=False)
+
+        plt.suptitle(f"{spacecraft_name} B-Field — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
+        fig1.autofmt_xdate()
+
+
+        # ====================================================================================
+        # PLOT 2: PLASMA (4 panels: Eflux, T, n, V)
+        # ====================================================================================
+        
+        fig2 = plt.figure(figsize=(14, 12))
+        gs2 = GridSpec(4, 1, figure=fig2, hspace=0.15)
+        ax_plasma = [fig2.add_subplot(gs2[i, 0]) for i in range(4)]
+
+        if icmes:
+            Plotter._add_icme_shading(ax_plasma, icmes, t0, t1)
+
+        # Eflux
         if swa and "eflux" in swa and swa.get("eflux") is not None:
             from matplotlib.dates import date2num
             import matplotlib.colors as mcolors
 
-            T_ef_full = ensure_datetime_array(swa["time"])
-            mask_ef   = (T_ef_full >= t0) & (T_ef_full <= t1)
+            t_ef_full = ensure_datetime_array(swa["time"])
+            mask_ef = (t_ef_full >= t0) & (t_ef_full <= t1)
 
             if np.any(mask_ef):
-                T_ef   = T_ef_full[mask_ef]
-                eflux  = np.array(swa["eflux"])[mask_ef]
+                t_ef = t_ef_full[mask_ef]
+                eflux = np.array(swa["eflux"])[mask_ef]
                 energy = swa.get("energy")
 
                 if eflux.ndim == 2 and energy is not None:
-                    times_mpl = date2num(T_ef)
-                    T_mesh, E_mesh = np.meshgrid(times_mpl, energy)
+                    times_mpl = date2num(t_ef)
+                    t_mesh, e_mesh = np.meshgrid(times_mpl, energy)
 
-                    pcm = axes[3].pcolormesh(
-                        T_mesh,
-                        E_mesh,
-                        eflux.T,
-                        shading="auto",
-                        cmap="jet",
-                        norm=mcolors.LogNorm(vmin=1e5, vmax=1e10),
-                    )
-                    axes[3].set_yscale("log")
-                    axes[3].set_ylabel("Energy [eV]")
-                    axes[3].set_ylim([100, 2e4])
+                    pcm = ax_plasma[0].pcolormesh(t_mesh, e_mesh, eflux.T, shading="auto", cmap="jet", norm=mcolors.LogNorm(vmin=1e5, vmax=1e10))
+                    ax_plasma[0].set_yscale("log")
+                    ax_plasma[0].set_ylabel("Energy [eV]", fontsize=11)
+                    ax_plasma[0].set_ylim([100, 2e4])
 
-                    position = axes[3].get_position()
-                    cax = fig.add_axes([position.x1 + 0.01,
-                                        position.y0,
-                                        0.015,
-                                        position.height])
-                    cbar = fig.colorbar(pcm, cax=cax)
-                    cbar.set_label(
-                        r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]",
-                        rotation=270, labelpad=20
-                    )
+                    pos = ax_plasma[0].get_position()
+                    cax = fig2.add_axes([pos.x1 + 0.01, pos.y0, 0.015, pos.height])
+                    cbar = fig2.colorbar(pcm, cax=cax)
+                    cbar.set_label(r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]", rotation=270, labelpad=20)
                 else:
-                    axes[3].text(0.5, 0.5, "No 2D eflux data",
-                                ha="center", va="center",
-                                transform=axes[3].transAxes)
+                    ax_plasma[0].text(0.5, 0.5, "No 2D eflux", ha="center", va="center", transform=ax_plasma[0].transAxes)
             else:
-                axes[3].text(0.5, 0.5, "No Eflux data in window",
-                            ha="center", va="center",
-                            transform=axes[3].transAxes)
+                ax_plasma[0].text(0.5, 0.5, "No Eflux in window", ha="center", va="center", transform=ax_plasma[0].transAxes)
         else:
-            axes[3].text(0.5, 0.5, "No Eflux data",
-                        ha="center", va="center",
-                        transform=axes[3].transAxes)
-        axes[3].grid(True, alpha=0.3)
+            ax_plasma[0].text(0.5, 0.5, "No Eflux", ha="center", va="center", transform=ax_plasma[0].transAxes)
+        ax_plasma[0].grid(True, alpha=0.3)
 
-        # Temperature (panel 4)
+        # Temperature
         if swa_moments and "T" in swa_moments:
-            T_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
             if np.any(mask_swa):
-                T_swa = T_swa_full[mask_swa]
-                T_data = np.array(swa_moments["T"])[mask_swa]
-                axes[4].plot(T_swa, T_data, linewidth=1.2, color="purple",
-                            label="Solar Orbiter T")
+                t_swa = t_swa_full[mask_swa]
+                t_data = np.array(swa_moments["T"])[mask_swa]
+                ax_plasma[1].plot(t_swa, t_data, linewidth=1.2, color="purple", label=f"{spacecraft_name} T")
+                
                 if l1_shifted and "T_shifted" in l1_shifted:
-                    T_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
                     if np.any(mask_l1):
-                        T_l1 = T_l1_full[mask_l1]
-                        T_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
-                        axes[4].plot(T_l1, T_l1_data, linewidth=1.0,
-                                    color="purple", linestyle='--', alpha=0.7,
-                                    label="L1 T (shifted)")
-                axes[4].set_ylabel("T [eV]")
-                axes[4].legend(loc="upper right", fontsize=8)
+                        t_l1 = t_l1_full[mask_l1]
+                        t_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
+                        ax_plasma[1].plot(t_l1, t_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 T (shifted)")
+                
+                ax_plasma[1].set_ylabel("T [eV]", fontsize=11)
+                ax_plasma[1].legend(loc="upper right", fontsize=8)
             else:
-                axes[4].text(0.5, 0.5, "No temperature data in window",
-                            ha="center", va="center", transform=axes[4].transAxes)
+                ax_plasma[1].text(0.5, 0.5, "No T in window", ha="center", va="center", transform=ax_plasma[1].transAxes)
         else:
-            axes[4].text(0.5, 0.5, "No temperature data",
-                        ha="center", va="center", transform=axes[4].transAxes)
-        axes[4].grid(True, alpha=0.3)
+            ax_plasma[1].text(0.5, 0.5, "No T", ha="center", va="center", transform=ax_plasma[1].transAxes)
+        ax_plasma[1].grid(True, alpha=0.3)
 
-        # Density (panel 5)
+        # Density
         if swa_moments and "n" in swa_moments:
-            T_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
             if np.any(mask_swa):
-                T_swa = T_swa_full[mask_swa]
+                t_swa = t_swa_full[mask_swa]
                 n_data = np.array(swa_moments["n"])[mask_swa]
-                axes[5].plot(T_swa, n_data, linewidth=1.2, color="orange",
-                            label="Solar Orbiter n")
+                ax_plasma[2].plot(t_swa, n_data, linewidth=1.2, color="orange", label=f"{spacecraft_name} n")
+                
                 if l1_shifted and "n_shifted" in l1_shifted:
-                    T_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
                     if np.any(mask_l1):
-                        T_l1 = T_l1_full[mask_l1]
+                        t_l1 = t_l1_full[mask_l1]
                         n_l1_data = np.array(l1_shifted["n_shifted"])[mask_l1]
-                        axes[5].plot(T_l1, n_l1_data, linewidth=1.0,
-                                    color="orange", linestyle='--', alpha=0.7,
-                                    label="L1 n (shifted)")
-                axes[5].set_ylabel("n [cm⁻³]")
-                axes[5].legend(loc="upper right", fontsize=8)
+                        ax_plasma[2].plot(t_l1, n_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 n (shifted)")
+                
+                ax_plasma[2].set_ylabel("n [cm⁻³]", fontsize=11)
+                ax_plasma[2].legend(loc="upper right", fontsize=8)
             else:
-                axes[5].text(0.5, 0.5, "No density data in window",
-                            ha="center", va="center", transform=axes[5].transAxes)
+                ax_plasma[2].text(0.5, 0.5, "No n in window", ha="center", va="center", transform=ax_plasma[2].transAxes)
         else:
-            axes[5].text(0.5, 0.5, "No density data",
-                        ha="center", va="center", transform=axes[5].transAxes)
-        axes[5].grid(True, alpha=0.3)
+            ax_plasma[2].text(0.5, 0.5, "No n", ha="center", va="center", transform=ax_plasma[2].transAxes)
+        ax_plasma[2].grid(True, alpha=0.3)
 
-        # Velocity (panel 6)
+        # Velocity
         if swa_moments and "V" in swa_moments:
-            T_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa   = (T_swa_full >= t0) & (T_swa_full <= t1)
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
             if np.any(mask_swa):
-                T_swa = T_swa_full[mask_swa]
-                V_data = np.array(swa_moments["V"])[mask_swa]
-                V_mag  = np.linalg.norm(V_data, axis=1)
-                axes[6].plot(T_swa, V_mag, linewidth=1.2, color="cyan",
-                            label="Solar Orbiter V")
+                t_swa = t_swa_full[mask_swa]
+                v_data = np.array(swa_moments["V"])[mask_swa]
+                v_mag = np.linalg.norm(v_data, axis=1)
+                ax_plasma[3].plot(t_swa, v_mag, linewidth=1.2, color="cyan", label=f"{spacecraft_name} V")
+                
                 if l1_shifted and "V_shifted" in l1_shifted:
-                    T_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1   = (T_l1_full >= t0) & (T_l1_full <= t1)
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
                     if np.any(mask_l1):
-                        T_l1 = T_l1_full[mask_l1]
-                        V_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
-                        V_l1_mag = np.linalg.norm(V_l1, axis=1)
-                        axes[6].plot(T_l1, V_l1_mag, linewidth=1.0,
-                                    color="cyan", linestyle='--', alpha=0.7,
-                                    label="L1 V (shifted)")
-                axes[6].set_ylabel("V [km/s]")
-                axes[6].legend(loc="upper right", fontsize=8)
+                        t_l1 = t_l1_full[mask_l1]
+                        v_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
+                        v_l1_mag = np.linalg.norm(v_l1, axis=1)
+                        ax_plasma[3].plot(t_l1, v_l1_mag, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 V (shifted)")
+                
+                ax_plasma[3].set_ylabel("V [km/s]", fontsize=11)
+                ax_plasma[3].legend(loc="upper right", fontsize=8)
             else:
-                axes[6].text(0.5, 0.5, "No velocity data in window",
-                            ha="center", va="center", transform=axes[6].transAxes)
+                ax_plasma[3].text(0.5, 0.5, "No V in window", ha="center", va="center", transform=ax_plasma[3].transAxes)
         else:
-            axes[6].text(0.5, 0.5, "No velocity data",
-                        ha="center", va="center", transform=axes[6].transAxes)
-        axes[6].grid(True, alpha=0.3)
+            ax_plasma[3].text(0.5, 0.5, "No V", ha="center", va="center", transform=ax_plasma[3].transAxes)
+        ax_plasma[3].grid(True, alpha=0.3)
 
-        # Dst (panel 7)
-        has_dst_data = False
+        ax_plasma[-1].set_xlabel("Time (UTC)", fontsize=11)
+        ax_plasma[-1].xaxis.set_major_locator(locator)
+        ax_plasma[-1].xaxis.set_major_formatter(formatter)
+        ax_plasma[-1].set_xlim(t_mag[0], t_mag[-1])
+        
+        for i in range(3):
+            ax_plasma[i].sharex(ax_plasma[3])
+            ax_plasma[i].tick_params(labelbottom=False)
+
+        plt.suptitle(f"{spacecraft_name} Plasma Parameters — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
+        fig2.autofmt_xdate()
+
+
+        # ====================================================================================
+        # PLOT 3: GEOMAGNETIC INDICES + POSITION (3 panels: Dst, Kp, Position)
+        # ====================================================================================
+        
+        fig3 = plt.figure(figsize=(14, 10))
+        gs3 = GridSpec(3, 1, figure=fig3, hspace=0.15)
+        ax_geo = [fig3.add_subplot(gs3[i, 0]) for i in range(3)]
+
+        if icmes:
+            Plotter._add_icme_shading(ax_geo, icmes, t0, t1)
+
+        # Dst
+        has_dst = False
         if dst_shifted:
-            axes[7].plot(dst_shifted["time"], dst_shifted["dst_shifted"],
-                        linewidth=1.5, color="blue",
-                        label="Measured Dst (Time-Shifted)", alpha=0.8)
-            has_dst_data = True
+            ax_geo[0].plot(dst_shifted["time"], dst_shifted["dst_shifted"], linewidth=1.5, color="blue", label="Measured Dst (Time-Shifted)", alpha=0.8)
+            has_dst = True
         if dst_pred:
-            axes[7].plot(dst_pred["time"], dst_pred["dst_predicted"],
-                        linewidth=1.5, color="red", linestyle="--",
-                        label="Predicted Dst (Crossover)", alpha=0.8)
-            has_dst_data = True
+            ax_geo[0].plot(dst_pred["time"], dst_pred["dst_predicted"], linewidth=1.5, color="red", linestyle="--", label="Predicted Dst (Crossover)", alpha=0.8)
+            has_dst = True
 
-        if has_dst_data:
-            axes[7].set_ylabel("Dst [nT]")
-            axes[7].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
-            axes[7].axhline(-50, color="orange", linestyle="--", alpha=0.3, linewidth=0.8,
-                            label="Moderate storm")
-            axes[7].axhline(-100, color="red", linestyle="--", alpha=0.3, linewidth=0.8,
-                            label="Strong storm")
-            axes[7].legend(loc="upper right", fontsize=8)
+        if has_dst:
+            ax_geo[0].set_ylabel("Dst [nT]", fontsize=11)
+            ax_geo[0].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
+            ax_geo[0].axhline(-50, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Moderate storm")
+            ax_geo[0].axhline(-100, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
+            ax_geo[0].legend(loc="upper right", fontsize=8)
         else:
-            axes[7].text(0.5, 0.5, "No Dst data",
-                        ha="center", va="center", transform=axes[7].transAxes)
-        axes[7].grid(True, alpha=0.3)
+            ax_geo[0].text(0.5, 0.5, "No Dst", ha="center", va="center", transform=ax_geo[0].transAxes)
+        ax_geo[0].grid(True, alpha=0.3)
 
-        # Kp (panel 8)
-        has_kp_data = False
+        # Kp
+        has_kp = False
         if kp_shifted:
-            axes[8].plot(kp_shifted["time"], kp_shifted["kp_shifted"],
-                        linewidth=1.5, color="blue", marker='o', markersize=4,
-                        label="Measured Kp (Time-Shifted)", alpha=0.8)
-            has_kp_data = True
+            ax_geo[1].plot(kp_shifted["time"], kp_shifted["kp_shifted"], linewidth=1.5, color="blue", label="Measured Kp (Time-Shifted)", alpha=0.8)
+            has_kp = True
         if kp_pred:
-            axes[8].plot(kp_pred["time"], kp_pred["kp_predicted"],
-                        linewidth=1.5, color="red", linestyle="--",
-                        marker='s', markersize=4,
-                        label="Predicted Kp (Crossover)", alpha=0.8)
-            has_kp_data = True
+            ax_geo[1].plot(kp_pred["time"], kp_pred["kp_predicted"], linewidth=1.5, color="red", linestyle="--", label="Predicted Kp (Crossover)", alpha=0.8)
+            has_kp = True
 
-        if has_kp_data:
-            axes[8].set_ylabel("Kp")
-            axes[8].set_ylim([0, 9])
-            axes[8].axhline(5, color="orange", linestyle="--", alpha=0.3, linewidth=0.8,
-                            label="Storm threshold")
-            axes[8].axhline(7, color="red", linestyle="--", alpha=0.3, linewidth=0.8,
-                            label="Strong storm")
-            axes[8].legend(loc="upper right", fontsize=8)
+        if has_kp:
+            ax_geo[1].set_ylabel("Kp", fontsize=11)
+            ax_geo[1].set_ylim([0, 9])
+            ax_geo[1].axhline(5, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Storm threshold")
+            ax_geo[1].axhline(7, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
+            ax_geo[1].legend(loc="upper right", fontsize=8)
         else:
-            axes[8].text(0.5, 0.5, "No Kp data",
-                        ha="center", va="center", transform=axes[8].transAxes)
-        axes[8].grid(True, alpha=0.3)
+            ax_geo[1].text(0.5, 0.5, "No Kp", ha="center", va="center", transform=ax_geo[1].transAxes)
+        ax_geo[1].grid(True, alpha=0.3)
 
-        # NEW: Distance and Angle (panel 9)
+        # Position (Distance + Angle)
         sc_times = spacecraft_ephemeris["times"]
         sc_positions = spacecraft_ephemeris["positions"]
         
         mask_sc = [(t0 <= t <= t1) for t in sc_times]
         if np.any(mask_sc):
-            T_sc = np.array(sc_times)[mask_sc]
+            t_sc = np.array(sc_times)[mask_sc]
             pos_sc = sc_positions[mask_sc]
             
-            # Calculate Earth positions at these times
-            earth_positions = np.array([
-                SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
-                for t in T_sc
-            ])
-            
-            # Calculate distances (in AU)
+            earth_positions = np.array([SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) for t in t_sc])
             distances = np.linalg.norm(pos_sc - earth_positions, axis=1) / AU_KM
             
-            # Calculate angles relative to Sun-Earth line
             angles = []
-            for i in range(len(T_sc)):
+            for i in range(len(t_sc)):
                 earth_vec = earth_positions[i]
                 sc_vec = pos_sc[i]
-                
-                # Normalize vectors (both from Sun at origin)
                 earth_hat = earth_vec / np.linalg.norm(earth_vec)
                 sc_hat = sc_vec / np.linalg.norm(sc_vec)
-                
-                # Angle between vectors
-                cos_angle = np.dot(earth_hat, sc_hat)
-                cos_angle = np.clip(cos_angle, -1.0, 1.0)
-                angle_rad = np.arccos(cos_angle)
-                angle_deg = np.degrees(angle_rad)
+                cos_angle = np.clip(np.dot(earth_hat, sc_hat), -1.0, 1.0)
+                angle_deg = np.degrees(np.arccos(cos_angle))
                 angles.append(angle_deg)
             
             angles = np.array(angles)
             
-            # Plot distance on left axis (black)
-            ax_dist = axes[9]
-            ax_dist.plot(T_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
-            ax_dist.set_ylabel('Distance [AU]', color='k', fontsize=11)
-            ax_dist.tick_params(axis='y', labelcolor='k')
-            ax_dist.grid(True, alpha=0.3)
+            ax_geo[2].plot(t_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
+            ax_geo[2].set_ylabel('Distance [AU]', color='k', fontsize=11)
+            ax_geo[2].tick_params(axis='y', labelcolor='k')
+            ax_geo[2].grid(True, alpha=0.3)
             
-            # Plot angle on right axis (red)
-            ax_angle = ax_dist.twinx()
-            ax_angle.plot(T_sc, angles, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
+            ax_angle = ax_geo[2].twinx()
+            ax_angle.plot(t_sc, angles, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
             ax_angle.set_ylabel('Angle [deg]', color='r', fontsize=11)
             ax_angle.tick_params(axis='y', labelcolor='r')
             
-            # Combined legend
-            lines1, labels1 = ax_dist.get_legend_handles_labels()
+            lines1, labels1 = ax_geo[2].get_legend_handles_labels()
             lines2, labels2 = ax_angle.get_legend_handles_labels()
-            ax_dist.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+            ax_geo[2].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
         else:
-            axes[9].text(0.5, 0.5, "No spacecraft ephemeris in window",
-                        ha="center", va="center", transform=axes[9].transAxes)
-            axes[9].grid(True, alpha=0.3)
+            ax_geo[2].text(0.5, 0.5, "No ephemeris in window", ha="center", va="center", transform=ax_geo[2].transAxes)
+            ax_geo[2].grid(True, alpha=0.3)
 
-        # Time axis formatting
-        from matplotlib.dates import DateFormatter, AutoDateLocator
-        axes[-1].set_xlabel("Time (UTC)")
-        locator = AutoDateLocator()
-        formatter = DateFormatter("%Y-%b-%d\n%H:%M")
-        axes[-1].xaxis.set_major_locator(locator)
-        axes[-1].xaxis.set_major_formatter(formatter)
+        ax_geo[-1].set_xlabel("Time (UTC)", fontsize=11)
+        ax_geo[-1].xaxis.set_major_locator(locator)
+        ax_geo[-1].xaxis.set_major_formatter(formatter)
+        ax_geo[-1].set_xlim(t_mag[0], t_mag[-1])
+        
+        for i in range(2):
+            ax_geo[i].sharex(ax_geo[2])
+            ax_geo[i].tick_params(labelbottom=False)
 
-        axes[-1].set_xlim(T_mag[0], T_mag[-1])
-        for i in range(9):  # CHANGED: 9 instead of 8
-            axes[i].sharex(axes[9])  # CHANGED: share with axes[9] instead of axes[8]
-            axes[i].tick_params(labelbottom=False)
+        plt.suptitle(f"{spacecraft_name} Geomagnetic Indices & Position — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
+        fig3.autofmt_xdate()
+        plt.tight_layout()
 
-        plt.suptitle(
-            f"Crossover Event with L1 Comparison — {center.strftime('%Y-%m-%d %H:%M:%S')}",
-            fontsize=14, y=0.995
-        )
-        fig.autofmt_xdate()
-        return fig
+        if output_folder:
+            safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
+            timestamp = center.strftime('%Y%m%d')
+            
+            filepath1 = os.path.join(output_folder, f"bfield_{safe_sc_name}_{timestamp}.png")
+            fig1.savefig(filepath1, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath1}")
+            plt.close(fig1)
+            
+            filepath2 = os.path.join(output_folder, f"plasma_{safe_sc_name}_{timestamp}.png")
+            fig2.savefig(filepath2, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath2}")
+            plt.close(fig2)
+            
+            filepath3 = os.path.join(output_folder, f"geomag_{safe_sc_name}_{timestamp}.png")
+            fig3.savefig(filepath3, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath3}")
+            plt.close(fig3)
 
-# ------------------------------- Main driver ------------------------------ #
+        return fig1, fig2, fig3
+    
+# ------------------------------- Main driver ----------------------------- #
 
 def main():
     print("Hénon DRO Constellation Crossover Analysis with L1 Comparison")
@@ -2528,19 +3043,20 @@ def main():
     print(f"DRO e = {ECCENTRICITY}, tolerances: SE={SUN_EARTH_TOL_AU} AU, "
           f"DRO={DRO_TOL_AU} AU, dt={DT_HOURS} h")
 
+    # Setup output folder if saving plots
+    output_folder = setup_output_folder()
+
     # Load ICME catalogue
-    icme_catalogue = ICMECatalogue.load_richardson_cane()
+    icme_catalogue = CME_Catalogue.load_catalouge()
     if not icme_catalogue:
-        # Try loading from local file as fallback
         print("    Attempting to load from local file...")
-        icme_catalogue = ICMECatalogue.load_from_local_file()
+        icme_catalogue = CME_Catalogue.load_from_local_file()
     
     if not icme_catalogue:
         print("\n⚠️  WARNING: Could not load ICME catalogue")
         print("    ICME back-propagation will be skipped")
         print("    Analysis will continue without ICME data\n")
     else:
-        # Filter to date range
         icme_catalogue = [icme for icme in icme_catalogue 
                          if START_DATE <= icme['start'] <= END_DATE]
         print(f"    ✓ {len(icme_catalogue)} ICMEs in date range {START_DATE:%Y-%m-%d} to {END_DATE:%Y-%m-%d}")
@@ -2550,12 +3066,11 @@ def main():
     print("Constellation ready (3 sats).")
 
     print("\nLoading spacecraft ephemerides...")
-    spacecraft_list = ["STEREO-A", "Solar Orbiter"]
+    spacecraft_list = ["STEREO-A", "STEREO-B", "Solar Orbiter"]
     spacecraft_data = {}
     for sc in spacecraft_list:
         print(f"[DBG] main: loading positions for {sc}")
-        data = SpacecraftData.get_positions(sc, START_DATE, END_DATE,
-                                            dt_hours=DT_HOURS)
+        data = SpacecraftData.get_positions(sc, START_DATE, END_DATE, dt_hours=DT_HOURS)
         if data:
             spacecraft_data[sc] = data
             print(f"{sc}: {len(data['times'])} samples")
@@ -2572,7 +3087,7 @@ def main():
     for sc, sc_data in spacecraft_data.items():
         print(f"[DBG] main: finding events for {sc}")
         ev   = finder.find_events(sc_data, START_DATE)
-        uniq = finder.group_events_by_day(ev)
+        uniq = finder.group_events_by_day(ev)  # Now includes filtering
         limit = EVENT_LIMIT.get(sc)
         if isinstance(limit, int) and limit >= 0:
             uniq = uniq[:limit]
@@ -2605,55 +3120,183 @@ def main():
     if records and WRITE_EVENTS_CSV:
         df = pd.DataFrame(records)
         df.sort_values(["Date", "Spacecraft"], inplace=True)
-        df.to_csv(CSV_FILENAME, index=False)
-        print(f"Events CSV: {CSV_FILENAME}  (rows: {len(df)})")
+        if output_folder:
+            csv_path = os.path.join(output_folder, CSV_FILENAME)
+            df.to_csv(csv_path, index=False)
+            print(f"Events CSV: {csv_path}  (rows: {len(df)})")
+        else:
+            df.to_csv(CSV_FILENAME, index=False)
+            print(f"Events CSV: {CSV_FILENAME}  (rows: {len(df)})")
 
-    if PLOT_OVERVIEW:
-        print("\nPlotting: overview...")
-        Plotter.plot_constellation_overview(all_events, constellation)
+    # ========================================================================
+    # LOAD IN-SITU DATA FOR ALL EVENTS (with full ICME matching)
+    # ========================================================================
+    
+    preloaded_data = {}
+    
+    for sc in all_events.keys():
+        if not all_events[sc]:
+            continue
+            
+        print(f"\n{'='*80}")
+        print(f"LOADING IN-SITU DATA FOR {sc}")
+        print(f"{'='*80}")
+        
+        if sc == "Solar Orbiter":
+            preloaded_data[sc] = SoloDataLoader.preload_all(
+                all_events[sc],
+                spacecraft_data[sc],
+                START_DATE,
+                icme_catalogue,
+                window_hours=INSITU_WINDOW_HR
+            )
+        elif sc in ["STEREO-A", "STEREO-B"]:
+            preloaded_data[sc] = STEREODataLoader.preload_all(
+                sc,
+                all_events[sc],
+                spacecraft_data[sc],
+                START_DATE,
+                icme_catalogue,
+                window_hours=INSITU_WINDOW_HR
+            )
+        else:
+            print(f"    Skipping {sc} - no data loader implemented")
+            preloaded_data[sc] = None
 
-    if PLOT_HELIOCENTRIC:
-        print("Plotting: heliocentric tracks (±21 d)...")
+    # ========================================================================
+    # FILTER EVENTS: Apply ICME filter if toggle is enabled
+    # ========================================================================
+    
+    if PLOT_ONLY_ICME_EVENTS:
+        print(f"\n{'='*80}")
+        print("FILTERING: Only events WITH ICME matches will be plotted")
+        print(f"{'='*80}\n")
+        
+        events_to_plot = {}
+        
         for sc, evs in all_events.items():
+            if not evs or preloaded_data.get(sc) is None:
+                events_to_plot[sc] = []
+                continue
+            
+            icme_filtered = []
             for e in evs:
+                t_ev = e["time"]
+                data = preloaded_data[sc].get(t_ev)
+                
+                # Check if this event has ICME matches
+                if data and data.get("icmes") is not None:
+                    icme_filtered.append(e)
+            
+            events_to_plot[sc] = icme_filtered
+            print(f"{sc}: {len(icme_filtered)} events WITH ICMEs (out of {len(evs)} total)")
+        
+        total_events = sum(len(v) for v in events_to_plot.values())
+        print(f"\n{'='*80}")
+        print(f"TOTAL EVENTS WITH ICMEs FOR PLOTTING: {total_events}")
+        print(f"{'='*80}\n")
+        
+    else:
+        print(f"\n{'='*80}")
+        print("PLOTTING: All events will be plotted (ICME filter disabled)")
+        print(f"{'='*80}\n")
+        
+        events_to_plot = all_events
+        
+        for sc, evs in all_events.items():
+            print(f"{sc}: {len(evs)} events")
+        
+        total_events = sum(len(v) for v in events_to_plot.values())
+        print(f"\n{'='*80}")
+        print(f"TOTAL EVENTS FOR PLOTTING: {total_events}")
+        print(f"{'='*80}\n")
+
+    # ========================================================================
+    # PLOTTING
+    # ========================================================================
+    
+    if PLOT_OVERVIEW:
+        print("\nPlotting: constellation overview (all events)...")
+        Plotter.plot_constellation_overview(all_events, constellation, output_folder)
+
+    if PLOT_HELIOCENTRIC and any(len(v) > 0 for v in events_to_plot.values()):
+        suffix = "ICME events only" if PLOT_ONLY_ICME_EVENTS else "all events"
+        print(f"\nPlotting: heliocentric tracks (±21 d) - {suffix}...")
+        for sc, evs in events_to_plot.items():
+            for e in evs:
+                print(f"  Plotting {sc} @ {e['time'].strftime('%Y-%m-%d')}")
                 Plotter.plot_event_detail(e, sc, constellation,
                                           spacecraft_data[sc], START_DATE,
-                                          context_days=TRACK_CONTEXT_DAYS)
+                                          context_days=TRACK_CONTEXT_DAYS,
+                                          output_folder=output_folder)
 
-    if PLOT_EARTH_FRAME:
-        print("Plotting: Earth-centered tracks (±21 d)...")
-        for sc, evs in all_events.items():
+    if PLOT_EARTH_FRAME and any(len(v) > 0 for v in events_to_plot.values()):
+        suffix = "ICME events only" if PLOT_ONLY_ICME_EVENTS else "all events"
+        print(f"\nPlotting: Earth-centered tracks (±21 d) - {suffix}...")
+        for sc, evs in events_to_plot.items():
             for e in evs:
+                print(f"  Plotting {sc} @ {e['time'].strftime('%Y-%m-%d')}")
                 Plotter.plot_event_detail_earth_frame(
                     e, sc, constellation, spacecraft_data[sc],
-                    START_DATE, context_days=TRACK_CONTEXT_DAYS
+                    START_DATE, context_days=TRACK_CONTEXT_DAYS,
+                    output_folder=output_folder
                 )
 
-    if PLOT_INSITU_DST and all_events.get("Solar Orbiter"):
-        print("\nLoading in-situ data...")
-        solo_preloaded = SoloDataLoader.preload_all(
-            all_events["Solar Orbiter"],
-            spacecraft_data["Solar Orbiter"],
-            START_DATE,
-            icme_catalogue,  # Pass ICME catalogue here
-            window_hours=INSITU_WINDOW_HR
-        )
-
-        print("\nGenerating plots...")
-        for e in all_events["Solar Orbiter"]:
-            fig = Plotter.plot_solo_insitu_with_dst(
-                e, 
-                solo_preloaded,
-                spacecraft_data["Solar Orbiter"],
-                START_DATE
-            )
-            if fig is None:
-                print(f"⚠️  Could not create plot for {e['time']}")
+    if PLOT_INSITU_DST:
+        suffix = "ICME events only" if PLOT_ONLY_ICME_EVENTS else "all events"
+        print(f"\nGenerating stack plots - {suffix}...")
+        
+        # Plot Solar Orbiter events
+        if events_to_plot.get("Solar Orbiter") and preloaded_data.get("Solar Orbiter"):
+            for e in events_to_plot["Solar Orbiter"]:
+                print(f"  Plotting Solar Orbiter @ {e['time'].strftime('%Y-%m-%d')}")
+                fig = Plotter.plot_solo_insitu_with_dst(
+                    e, 
+                    preloaded_data["Solar Orbiter"],
+                    spacecraft_data["Solar Orbiter"],
+                    START_DATE,
+                    spacecraft_name="Solar Orbiter",
+                    output_folder=output_folder
+                )
+                if fig is None:
+                    print(f"⚠️  Could not create plot for {e['time']}")
+        
+        # Plot STEREO-A events
+        if events_to_plot.get("STEREO-A") and preloaded_data.get("STEREO-A"):
+            for e in events_to_plot["STEREO-A"]:
+                print(f"  Plotting STEREO-A @ {e['time'].strftime('%Y-%m-%d')}")
+                fig = Plotter.plot_solo_insitu_with_dst(
+                    e, 
+                    preloaded_data["STEREO-A"],
+                    spacecraft_data["STEREO-A"],
+                    START_DATE,
+                    spacecraft_name="STEREO-A",
+                    output_folder=output_folder
+                )
+                if fig is None:
+                    print(f"⚠️  Could not create plot for {e['time']}")
+        
+        # Plot STEREO-B events
+        if events_to_plot.get("STEREO-B") and preloaded_data.get("STEREO-B"):
+            for e in events_to_plot["STEREO-B"]:
+                print(f"  Plotting STEREO-B @ {e['time'].strftime('%Y-%m-%d')}")
+                fig = Plotter.plot_solo_insitu_with_dst(
+                    e, 
+                    preloaded_data["STEREO-B"],
+                    spacecraft_data["STEREO-B"],
+                    START_DATE,
+                    spacecraft_name="STEREO-B",
+                    output_folder=output_folder
+                )
+                if fig is None:
+                    print(f"⚠️  Could not create plot for {e['time']}")
 
     print("\nDone.")
-    plt.show()
+    if not SAVE_PLOTS_TO_FILE:
+        plt.show()
+    else:
+        print(f"\nAll plots saved to: {output_folder}")
 
 
 if __name__ == "__main__":
     main()
-
