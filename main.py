@@ -172,6 +172,7 @@ plt.rcParams.update({
 AU_KM = 1.496e8
 YEAR_DAYS = 365.25
 MEAN_MOTION = 2 * np.pi / YEAR_DAYS
+EARTH_EPHEMERIS_MARGIN_DAYS = 60 
 
 START_DATE = datetime(2006, 1, 1)
 END_DATE = datetime(2024, 12, 31)
@@ -192,15 +193,15 @@ PLOT_EARTH_FRAME = True
 PLOT_INSITU_DST = True
 
 FILTER_SUNWARD_ONLY = True  
-SAVE_PLOTS_TO_FILE = False 
+SAVE_PLOTS_TO_FILE = True 
 
 FIGURES_ROOT = '/Users/henryhodges/Documents/Year 4/Masters/Code/figures'
 
 EVENT_LIMIT = {
-    "STEREO-A": None,
-    "Solar Orbiter": None,
-    "Parker Solar Probe": None,
-    "STEREO-B": None,
+    "STEREO-A": 5,
+    "Solar Orbiter": 5,
+    "Parker Solar Probe": 5,
+    "STEREO-B": 5,
 }
 
 WRITE_EVENTS_CSV = True
@@ -288,10 +289,11 @@ class DROConstellation:
 
 class SpacecraftData:
     HORIZONS_IDS = {
-        "STEREO-A":      "-234",
-        "STEREO-B":      "-235",
-        "Solar Orbiter": "-144",
-        "Parker Solar Probe": "-96",
+        "STEREO-A":          "-234",
+        "STEREO-B":          "-235",
+        "Solar Orbiter":     "-144",
+        "Parker Solar Probe":"-96",
+        "Earth":             "399", 
     }
 
     @staticmethod
@@ -349,9 +351,64 @@ class SpacecraftData:
 
 
 class SunEarthLineAnalyzer:
+    """
+    Handles Sun–Earth line geometry using preloaded JPL Horizons Earth ephemeris.
+
+    Usage:
+        1) Call SunEarthLineAnalyzer.set_earth_ephemeris(times, positions) once
+        2) Use earth_position_at_time(time_dt, epoch_dt) everywhere as before
+           (epoch_dt argument is now ignored; kept only for backward compatibility)
+    """
+    _earth_t_sec = None
+    _earth_x = None
+    _earth_y = None
+    _earth_z = None
+
     @staticmethod
-    def earth_position_at_time(time_dt, epoch_dt):
-        days  = (time_dt - epoch_dt).total_seconds() / 86400
+    def set_earth_ephemeris(times, positions):
+        """
+        Preload Earth positions from JPL Horizons.
+
+        Args:
+            times: list of datetime objects
+            positions: numpy array [N, 3] in km (heliocentric ecliptic IAU76)
+        """
+        if times is None or positions is None or len(times) == 0:
+            raise ValueError("Empty Earth ephemeris passed to set_earth_ephemeris")
+
+        t_sec = np.array([t.timestamp() for t in times], dtype=float)
+        pos   = np.asarray(positions, dtype=float)
+
+        SunEarthLineAnalyzer._earth_t_sec = t_sec
+        SunEarthLineAnalyzer._earth_x     = pos[:, 0]
+        SunEarthLineAnalyzer._earth_y     = pos[:, 1]
+        SunEarthLineAnalyzer._earth_z     = pos[:, 2]
+
+        print(f"[DBG] SunEarthLineAnalyzer: loaded Earth ephemeris with {len(t_sec)} samples "
+              f"({times[0]} → {times[-1]})")
+
+    @staticmethod
+    def earth_position_at_time(time_dt, epoch_dt=None):
+        """
+        Return Earth position [x,y,z] in km at given time, using Horizons ephemeris.
+
+        epoch_dt is ignored (kept only so existing calls do not break).
+        Falls back to old circular model if no ephemeris has been preloaded.
+        """
+        if SunEarthLineAnalyzer._earth_t_sec is not None:
+            t = float(time_dt.timestamp())
+            # 1D linear interpolation for each component
+            x = np.interp(t, SunEarthLineAnalyzer._earth_t_sec, SunEarthLineAnalyzer._earth_x)
+            y = np.interp(t, SunEarthLineAnalyzer._earth_t_sec, SunEarthLineAnalyzer._earth_y)
+            z = np.interp(t, SunEarthLineAnalyzer._earth_t_sec, SunEarthLineAnalyzer._earth_z)
+            return np.array([x, y, z])
+
+        # Fallback: original circular-orbit approximation
+        if epoch_dt is None:
+            raise RuntimeError(
+                "Earth ephemeris not set and no epoch_dt provided for fallback."
+            )
+        days  = (time_dt - epoch_dt).total_seconds() / 86400.0
         theta = MEAN_MOTION * days
         return np.array([AU_KM * np.cos(theta), AU_KM * np.sin(theta), 0.0])
 
@@ -365,7 +422,7 @@ class SunEarthLineAnalyzer:
         perp   = w - proj
         is_between = 0 < s < np.linalg.norm(v)
         return np.linalg.norm(perp), s, is_between
-
+    
 
 class CrossoverFinder:
     def __init__(self, constellation, sun_earth_tolerance_au=0.05, dro_tolerance_au=0.05):
@@ -3080,11 +3137,31 @@ def main():
     if not spacecraft_data:
         print("No spacecraft data available.")
         return
+    
+    print(f"[DBG] main: loading positions for Earth (with margin ±{EARTH_EPHEMERIS_MARGIN_DAYS} days)")
+    earth_start = START_DATE - timedelta(days=EARTH_EPHEMERIS_MARGIN_DAYS)
+    earth_end   = END_DATE   + timedelta(days=EARTH_EPHEMERIS_MARGIN_DAYS)
+    earth_data  = SpacecraftData.get_positions("Earth", earth_start, earth_end, dt_hours=DT_HOURS)
+
+    if earth_data:
+        SunEarthLineAnalyzer.set_earth_ephemeris(earth_data["times"], earth_data["positions"])
+        # Optional: keep Earth ephemeris available in spacecraft_data if you ever want it
+        spacecraft_data["Earth"] = earth_data
+    else:
+        print("⚠️  WARNING: Failed to load Earth ephemeris from Horizons")
+        print("    Geometry will fall back to simple circular Earth orbit.")
+
 
     print("\nFinding crossover events...")
     finder = CrossoverFinder(constellation, SUN_EARTH_TOL_AU, DRO_TOL_AU)
     all_events = {}
-    for sc, sc_data in spacecraft_data.items():
+
+    # Only treat actual spacecraft as targets, NOT Earth
+    for sc in spacecraft_list:
+        if sc not in spacecraft_data:
+            continue
+        sc_data = spacecraft_data[sc]
+
         print(f"[DBG] main: finding events for {sc}")
         ev   = finder.find_events(sc_data, START_DATE)
         uniq = finder.group_events_by_day(ev)  # Now includes filtering
