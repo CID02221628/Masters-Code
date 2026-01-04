@@ -174,13 +174,13 @@ YEAR_DAYS = 365.25
 MEAN_MOTION = 2 * np.pi / YEAR_DAYS
 EARTH_EPHEMERIS_MARGIN_DAYS = 60 
 
-START_DATE = datetime(2006, 1, 1)
+START_DATE = datetime(2007, 1, 1)
 END_DATE = datetime(2024, 12, 31)
 ECCENTRICITY = 0.10
-SUN_EARTH_TOL_AU= 0.1
-DRO_TOL_AU = 0.2
+SUN_EARTH_TOL_AU= 0.18
+DRO_TOL_AU = 0.4
 DT_HOURS = 6
-INSITU_WINDOW_HR = 120  # ± 5 days
+INSITU_WINDOW_HR = 144  # ± 5 days
 
 # target cadence for MAG decimation (~1 point per minute per day-file)
 MAG_TARGET_POINTS_PER_DAY = 1440
@@ -198,10 +198,10 @@ SAVE_PLOTS_TO_FILE = True
 FIGURES_ROOT = '/Users/henryhodges/Documents/Year 4/Masters/Code/figures'
 
 EVENT_LIMIT = {
-    "STEREO-A": 5,
-    "Solar Orbiter": 5,
-    "Parker Solar Probe": 5,
-    "STEREO-B": 5,
+    "STEREO-A": 1,
+    "Solar Orbiter": 1,
+    "Parker Solar Probe": 1,
+    "STEREO-B": 1,
 }
 
 WRITE_EVENTS_CSV = True
@@ -2100,7 +2100,13 @@ class STEREODataLoader:
     @staticmethod
     def load_plasma(spacecraft, t0_dt, t1_dt):
         """
-        Load STEREO PLASTIC plasma moments (L2 1-min).
+        Load STEREO PLASTIC plasma moments (L2 1-min) with robust variable detection.
+        
+        Key features:
+        - Tries multiple variable name candidates for n, V, T
+        - Handles 1D velocity (converts to 3D: [V, 0, 0])
+        - Auto-detects Kelvin and converts to eV
+        - Extensive debug output
         
         Args:
             spacecraft: "STEREO-A" or "STEREO-B"
@@ -2108,13 +2114,17 @@ class STEREODataLoader:
             t1_dt: End datetime
             
         Returns:
-            {"time": datetime array, "n": density, "V": [N×3] velocity, "T": temperature} or None
+            {"time": datetime array, "n": density [cm^-3], "V": [N×3] velocity [km/s], "T": temperature [eV]} or None
         """
         try:
             probe = 'a' if spacecraft == "STEREO-A" else 'b'
             
             trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                     t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+                    t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+            
+            print(f"    ✓ Calling pyspedas.projects.stereo.plastic()")
+            print(f"      trange: {trange}")
+            print(f"      probe: {probe}")
             
             files = pyspedas.projects.stereo.plastic(
                 trange=trange,
@@ -2124,100 +2134,219 @@ class STEREODataLoader:
             )
             
             if not files:
-                print(f"    [DBG] {spacecraft} PLASTIC: no files returned")
+                print(f"    ❌ NO FILES RETURNED from pyspedas")
                 return None
             
-            print(f"    Reading {len(files)} PLASTIC files...")
+            print(f"    ✓ Got {len(files)} PLASTIC files:")
+            for f in files:
+                print(f"      - {os.path.basename(f)}")
+            
             all_times = []
             all_n = []
             all_V = []
             all_T = []
             
+            n_candidates = ['proton_number_density', 'Np', 'N', 'n_p', 'density']
+            v_candidates = ['proton_bulk_speed', 'Vp_RTN', 'Vp', 'V', 'v_p', 'velocity']
+            t_candidates = ['proton_temperature', 'Tp', 'T', 't_p', 'temperature']
+            
             for cdf_file in files:
+                print(f"\n    📁 Reading: {os.path.basename(cdf_file)}")
                 cdf = safe_cdf_read(cdf_file)
                 if not cdf:
+                    print(f"      ❌ Failed to read CDF")
                     continue
                 
                 try:
-                    vars_list = cdf.cdf_info().zVariables
+                    cdf_info = cdf.cdf_info()
+                    vars_list = cdf_info.zVariables
                     
+                    print(f"      ✓ CDF contains {len(vars_list)} variables:")
+                    print(f"        {vars_list}")
+                    
+                    # Find epoch
                     epoch_var = next((v for v in ['epoch', 'Epoch', 'EPOCH'] if v in vars_list), None)
                     if not epoch_var:
+                        print(f"      ❌ No epoch variable found")
                         continue
                     
+                    print(f"      ✓ Found: '{epoch_var}'")
                     epoch = cdf.varget(epoch_var)
                     times_dt = cdflib.cdfepoch.to_datetime(epoch)
+                    print(f"        Shape: {np.shape(epoch)}, Points: {len(times_dt)}")
                     
+                    # Find density
                     n_data = None
-                    for n_var in ['proton_number_density', 'Np', 'N']:
+                    n_var_found = None
+                    for n_var in n_candidates:
                         if n_var in vars_list:
                             try:
                                 n_data = cdf.varget(n_var)
+                                n_var_found = n_var
+                                print(f"      ✓ Found: '{n_var}' (density)")
+                                print(f"        Shape: {np.shape(n_data)}")
                                 break
-                            except:
+                            except Exception as e:
+                                print(f"      ⚠️  '{n_var}' exists but failed to read: {e}")
                                 continue
                     
+                    if n_data is None:
+                        print(f"      ❌ No density variable found (tried: {n_candidates})")
+                    
+                    # Find velocity
                     v_data = None
-                    for v_var in ['proton_bulk_speed', 'Vp_RTN', 'Vp', 'V']:
+                    v_var_found = None
+                    for v_var in v_candidates:
                         if v_var in vars_list:
                             try:
                                 v_data = cdf.varget(v_var)
+                                v_var_found = v_var
+                                print(f"      ✓ Found: '{v_var}' (velocity)")
+                                print(f"        Shape: {np.shape(v_data)}, ndim: {v_data.ndim}")
+                                
+                                # Handle 1D velocity (scalar speed)
                                 if v_data.ndim == 1:
+                                    print(f"        ⚠️  1D velocity detected - converting to 3D: [V, 0, 0]")
                                     v_data = np.column_stack([v_data, np.zeros(len(v_data)), np.zeros(len(v_data))])
+                                    print(f"        New shape: {np.shape(v_data)}")
+                                
                                 break
-                            except:
+                            except Exception as e:
+                                print(f"      ⚠️  '{v_var}' exists but failed to read: {e}")
                                 continue
                     
+                    if v_data is None:
+                        print(f"      ❌ No velocity variable found (tried: {v_candidates})")
+                    
+                    # Find temperature
                     t_data = None
-                    for t_var in ['proton_temperature', 'Tp', 'T']:
+                    t_var_found = None
+                    for t_var in t_candidates:
                         if t_var in vars_list:
                             try:
                                 t_data = cdf.varget(t_var)
+                                t_var_found = t_var
+                                print(f"      ✓ Found: '{t_var}' (temperature)")
+                                print(f"        Shape: {np.shape(t_data)}")
+                                
+                                # Check if in Kelvin (median > 1000 suggests Kelvin)
+                                valid_t = t_data[(t_data > 0) & (t_data < 1e7)]
+                                if len(valid_t) > 0:
+                                    median_t = np.median(valid_t)
+                                    print(f"        Median T (valid): {median_t:.1f}")
+                                    if median_t > 1000:
+                                        print(f"        ⚠️  Likely in KELVIN (median > 1000)")
+                                
                                 break
-                            except:
+                            except Exception as e:
+                                print(f"      ⚠️  '{t_var}' exists but failed to read: {e}")
                                 continue
                     
+                    if t_data is None:
+                        print(f"      ❌ No temperature variable found (tried: {t_candidates})")
+                    
+                    # Accumulate data
                     if n_data is not None or v_data is not None or t_data is not None:
+                        n_points = len(times_dt)
                         all_times.extend(times_dt)
-                        all_n.extend(n_data if n_data is not None else [np.nan] * len(times_dt))
-                        all_V.extend(v_data if v_data is not None else [[np.nan, np.nan, np.nan]] * len(times_dt))
-                        all_T.extend(t_data if t_data is not None else [np.nan] * len(times_dt))
+                        
+                        if n_data is not None:
+                            all_n.extend(n_data)
+                        else:
+                            all_n.extend([np.nan] * n_points)
+                        
+                        if v_data is not None:
+                            all_V.extend(v_data)
+                        else:
+                            all_V.extend([[np.nan, np.nan, np.nan]] * n_points)
+                        
+                        if t_data is not None:
+                            all_T.extend(t_data)
+                        else:
+                            all_T.extend([np.nan] * n_points)
+                        
+                        print(f"      ✓ Accumulated {n_points} points")
+                    else:
+                        print(f"      ⚠️  No plasma data found in this file")
                 
                 except Exception as e:
-                    print(f"    Err {spacecraft} PLASTIC {os.path.basename(cdf_file)}: {e}")
+                    print(f"      ❌ Error reading {os.path.basename(cdf_file)}: {e}")
                     continue
             
             if not all_times:
-                print(f"    [DBG] {spacecraft} PLASTIC: no data read from files")
+                print(f"\n    ❌ FINAL RESULT: No PLASTIC data loaded")
                 return None
             
+            print(f"\n    ✓ FINAL RESULT: PLASTIC DATA LOADED")
+            print(f"      Total points: {len(all_times)}")
+            
+            # Convert to arrays
             times_arr = ensure_datetime_array(all_times)
             n_arr = np.array(all_n, dtype=float)
             v_arr = np.array(all_V, dtype=float)
             t_arr = np.array(all_T, dtype=float)
             
-            # Clean
-            n_arr[(~np.isfinite(n_arr)) | (n_arr < 0) | (n_arr > 1000)] = np.nan
-            v_arr[(~np.isfinite(v_arr)) | (np.abs(v_arr) > 3000)] = np.nan
-            t_arr[(~np.isfinite(t_arr)) | (t_arr < 0)] = np.nan
+            print(f"      Time range: {times_arr[0]} → {times_arr[-1]}")
+            print(f"      n shape: {n_arr.shape}")
+            print(f"      V shape: {v_arr.shape}")
+            print(f"      T shape: {t_arr.shape}")
             
-            # Convert Kelvin to eV if needed
-            if np.nanmedian(t_arr) > 1000:
-                print(f"    Converting T: Kelvin → eV")
-                t_arr = t_arr / 11604.5
+            # =====================================================================
+            # CLEANING
+            # =====================================================================
+            print(f"\n    🧹 CLEANING DATA:")
             
-            # Sort
+            # Density cleaning
+            n_before = np.sum(np.isfinite(n_arr))
+            n_arr[(~np.isfinite(n_arr)) | (n_arr < 0) | (n_arr > 1000) | (n_arr == 9999) | (n_arr == 99999)] = np.nan
+            n_after = np.sum(np.isfinite(n_arr))
+            print(f"      n: {n_before} → {n_after} valid points (removed {n_before - n_after})")
+            
+            # Velocity cleaning
+            v_before = np.sum(np.all(np.isfinite(v_arr), axis=1))
+            v_arr[(~np.isfinite(v_arr)) | (np.abs(v_arr) > 3000) | (v_arr == 9999) | (v_arr == 99999)] = np.nan
+            v_after = np.sum(np.all(np.isfinite(v_arr), axis=1))
+            print(f"      V: {v_before} → {v_after} valid vectors (removed {v_before - v_after})")
+            
+            # Temperature cleaning + Kelvin → eV conversion
+            t_before = np.sum(np.isfinite(t_arr))
+            t_arr[(~np.isfinite(t_arr)) | (t_arr < 0) | (t_arr > 1e7) | (t_arr == 9999) | (t_arr == 99999)] = np.nan
+            
+            # Auto-detect Kelvin and convert to eV
+            valid_t = t_arr[np.isfinite(t_arr)]
+            if len(valid_t) > 0:
+                median_t = np.median(valid_t)
+                if median_t > 1000:
+                    print(f"      T: Detected KELVIN (median={median_t:.1f} K)")
+                    print(f"         Converting Kelvin → eV (dividing by 11604.5)")
+                    t_arr = t_arr / 11604.5
+                    median_t_ev = np.median(t_arr[np.isfinite(t_arr)])
+                    print(f"         New median: {median_t_ev:.2f} eV")
+            
+            t_after = np.sum(np.isfinite(t_arr))
+            print(f"      T: {t_before} → {t_after} valid points (removed {t_before - t_after})")
+            
+            # =====================================================================
+            # SORTING
+            # =====================================================================
+            print(f"\n    📊 SORTING BY TIME:")
             sort_idx = np.argsort([t.timestamp() for t in times_arr])
             times_arr = times_arr[sort_idx]
             n_arr = n_arr[sort_idx]
             v_arr = v_arr[sort_idx]
             t_arr = t_arr[sort_idx]
+            print(f"      ✓ Data sorted chronologically")
             
-            print(f"    ✓ {spacecraft} PLASTIC: {len(times_arr)} points")
+            # =====================================================================
+            # FINAL STATISTICS
+            # =====================================================================
+            print(f"\n    📈 FINAL STATISTICS:")
             _dbg_stats(f"{spacecraft} n", n_arr, "cm^-3", expected_min=0, expected_max=100)
             _dbg_stats(f"{spacecraft} |V|", np.linalg.norm(v_arr, axis=1), "km/s", 
-                      expected_min=0, expected_max=1000)
+                    expected_min=0, expected_max=1000)
             _dbg_stats(f"{spacecraft} T", t_arr, "eV", expected_min=0, expected_max=500)
+            
+            print(f"\n    ✓ {spacecraft} PLASTIC: {len(times_arr)} points successfully loaded")
             
             return {
                 "time": times_arr,
@@ -2227,14 +2356,18 @@ class STEREODataLoader:
             }
         
         except Exception as e:
-            print(f"    {spacecraft} PLASTIC error: {e}")
+            print(f"    ❌ {spacecraft} PLASTIC error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
-    
+
     @staticmethod
     def load_eflux(spacecraft, t0_dt, t1_dt):
         """
         Attempt to load STEREO PLASTIC energy flux spectrogram.
-        Note: STEREO PLASTIC L2 may not contain full eflux spectrograms.
+        
+        Note: STEREO PLASTIC L2 files typically do NOT contain full eflux spectrograms.
+        This is normal/expected - "No Eflux data" message is NOT an error.
         
         Returns:
             {"time": datetime array, "eflux": [N×E] array, "energy": energy bins} or None
@@ -2243,7 +2376,9 @@ class STEREODataLoader:
             probe = 'a' if spacecraft == "STEREO-A" else 'b'
             
             trange = [t0_dt.strftime("%Y-%m-%d/%H:%M:%S"),
-                     t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+                    t1_dt.strftime("%Y-%m-%d/%H:%M:%S")]
+            
+            print(f"    ✓ Calling pyspedas.projects.stereo.plastic() for eflux")
             
             files = pyspedas.projects.stereo.plastic(
                 trange=trange,
@@ -2253,12 +2388,18 @@ class STEREODataLoader:
             )
             
             if not files:
+                print(f"    ℹ️  No PLASTIC files for eflux check")
                 return None
             
             print(f"    Reading {len(files)} PLASTIC files for eflux...")
             all_times = []
             all_eflux = []
             energy_bins = None
+            
+            eflux_candidates = ['eflux', 'EFLUX', 'diff_en_fluxes', 'energy_flux']
+            energy_candidates = ['energy', 'Energy', 'ENERGY', 'energy_vals']
+            
+            found_any = False
             
             for cdf_file in files:
                 cdf = safe_cdf_read(cdf_file)
@@ -2270,12 +2411,15 @@ class STEREODataLoader:
                     
                     # Look for eflux-like variables
                     eflux_var = None
-                    for candidate in ['eflux', 'EFLUX', 'diff_en_fluxes', 'energy_flux']:
+                    for candidate in eflux_candidates:
                         if candidate in vars_list:
                             eflux_var = candidate
                             break
                     
                     if eflux_var:
+                        found_any = True
+                        print(f"      ✓ Found eflux variable: '{eflux_var}'")
+                        
                         epoch_var = next((v for v in ['epoch', 'Epoch', 'EPOCH'] if v in vars_list), None)
                         if not epoch_var:
                             continue
@@ -2286,22 +2430,29 @@ class STEREODataLoader:
                         
                         # Try to get energy bins
                         if energy_bins is None:
-                            for e_var in ['energy', 'Energy', 'ENERGY', 'energy_vals']:
+                            for e_var in energy_candidates:
                                 if e_var in vars_list:
                                     try:
                                         energy_bins = cdf.varget(e_var)
+                                        print(f"      ✓ Found energy bins: {len(energy_bins)} energies")
                                         break
                                     except:
                                         continue
                         
                         all_times.extend(times_dt)
                         all_eflux.append(eflux_data)
+                        print(f"      ✓ Accumulated eflux data: shape {np.shape(eflux_data)}")
                 
-                except Exception:
+                except Exception as e:
+                    print(f"      ⚠️  Error checking {os.path.basename(cdf_file)}: {e}")
                     continue
             
+            if not found_any:
+                print(f"    ℹ️  No eflux data in PLASTIC L2 files (this is normal/expected)")
+                return None
+            
             if not all_times or not all_eflux:
-                print(f"    [DBG] {spacecraft} EFLUX: not found in PLASTIC L2 files")
+                print(f"    ℹ️  No eflux data accumulated")
                 return None
             
             times_arr = ensure_datetime_array(all_times)
@@ -2321,9 +2472,9 @@ class STEREODataLoader:
             }
         
         except Exception as e:
-            print(f"    {spacecraft} EFLUX error: {e}")
+            print(f"    ℹ️  {spacecraft} EFLUX: {e} (this is normal - most PLASTIC L2 files don't have eflux)")
             return None
-    
+
     @staticmethod
     def interpolate_to_mag_time(mag_data, plasma_data):
         """
