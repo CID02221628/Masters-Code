@@ -192,10 +192,10 @@ MVAB_WINDOW_MINUTES = 30     # Time window for MVAB analysis
 MVAB_QUALITY_MIN = 3.0       # Minimum eigenvalue ratio (λ_max/λ_min)
 
 EVENT_LIMIT = {
-    "STEREO-A": 10,
-    "Solar Orbiter": 10,
-    "Parker Solar Probe": 10,
-    "STEREO-B": 10,
+    "STEREO-A": None,
+    "Solar Orbiter": None,
+    "Parker Solar Probe": None,
+    "STEREO-B": None,
 }
 
 WRITE_EVENTS_CSV = True
@@ -1137,7 +1137,23 @@ class CME_Catalogue:
     
     @staticmethod
     def backpropagate_icmes(event, spacecraft_ephemeris, epoch_date, icme_list,
-                        common_data=None, tolerance_hours=24):
+                        common_data=None, tolerance_hours=24, use_mvab=False, mvab_data=None):
+        """
+        Back-propagate ICMEs from Earth to spacecraft using either ballistic or MVAB propagation.
+        
+        Args:
+            event: Crossover event dictionary
+            spacecraft_ephemeris: S/C ephemeris data
+            epoch_date: Epoch datetime
+            icme_list: List of ICME events from catalogue
+            common_data: Common spacecraft data (for velocity)
+            tolerance_hours: Matching tolerance window
+            use_mvab: If True, use MVAB-based propagation
+            mvab_data: MVAB propagation data (must contain 'propagation_delay_hours' and 'time')
+        
+        Returns:
+            List of matched ICMEs with back-propagated times, or None
+        """
         print(f"\n{'='*80}")
         print(f"[ICME BACKPROP] Starting back-propagation for event")
         print(f"{'='*80}")
@@ -1161,28 +1177,53 @@ class CME_Catalogue:
         print(f"[ICME BACKPROP] Earth position: [{earth_pos[0]/AU_KM:.3f}, {earth_pos[1]/AU_KM:.3f}, {earth_pos[2]/AU_KM:.3f}] AU")
         print(f"[ICME BACKPROP] Distance S/C → Earth: {distance_au:.3f} AU ({distance_km:.1e} km)")
         
-        # Get solar wind velocity from measurements if available
-        if common_data and "V" in common_data:
-            # Find V measurement closest to crossover time
-            times_common = common_data["time"]
-            time_diffs = [abs((t - t_crossover).total_seconds()) for t in times_common]
+        # Determine propagation method and calculate delay
+        if use_mvab and mvab_data:
+            print(f"[ICME BACKPROP] ✓ Using MVAB propagation")
+            
+            # Find the MVAB delay closest to crossover time
+            mvab_times = mvab_data["time"]
+            time_diffs = [abs((t - t_crossover).total_seconds()) for t in mvab_times]
             idx_closest = np.argmin(time_diffs)
-            V_vec = common_data["V"][idx_closest]
-            v_sw_kms = np.linalg.norm(V_vec)
-            print(f"[ICME BACKPROP] ✓ Using measured V_sw = {v_sw_kms:.1f} km/s")
-            print(f"[ICME BACKPROP]   V vector: [{V_vec[0]:.1f}, {V_vec[1]:.1f}, {V_vec[2]:.1f}] km/s")
-            print(f"[ICME BACKPROP]   Closest measurement: {times_common[idx_closest]} (Δt = {time_diffs[idx_closest]/60:.1f} min)")
+            
+            propagation_time_hrs = mvab_data["propagation_delay_hours"][idx_closest]
+            propagation_time_sec = propagation_time_hrs * 3600.0
+            
+            # Get MVAB quality info if available
+            if "mvab_qualities" in mvab_data:
+                quality = mvab_data["mvab_qualities"][idx_closest]
+                print(f"[ICME BACKPROP]   MVAB quality (λ_max/λ_min): {quality:.2f}")
+            
+            print(f"[ICME BACKPROP]   Propagation time: {propagation_time_hrs:.1f} hours ({propagation_time_hrs/24:.2f} days)")
+            print(f"[ICME BACKPROP]   Closest measurement: {mvab_times[idx_closest]} (Δt = {time_diffs[idx_closest]/60:.1f} min)")
+            
+            # Calculate implied velocity for context
+            v_sw_kms = distance_km / propagation_time_sec
+            print(f"[ICME BACKPROP]   Implied V_sw: {v_sw_kms:.1f} km/s")
+            
         else:
-            # Use typical solar wind speed as fallback
-            v_sw_kms = 400.0
-            print(f"[ICME BACKPROP] ⚠️  Using default V_sw = {v_sw_kms:.1f} km/s (no SWA data available)")
+            print(f"[ICME BACKPROP] ✓ Using ballistic propagation")
+            
+            # Get solar wind velocity from measurements if available
+            if common_data and "V" in common_data:
+                times_common = common_data["time"]
+                time_diffs = [abs((t - t_crossover).total_seconds()) for t in times_common]
+                idx_closest = np.argmin(time_diffs)
+                V_vec = common_data["V"][idx_closest]
+                v_sw_kms = np.linalg.norm(V_vec)
+                print(f"[ICME BACKPROP]   ✓ Using measured V_sw = {v_sw_kms:.1f} km/s")
+                print(f"[ICME BACKPROP]     V vector: [{V_vec[0]:.1f}, {V_vec[1]:.1f}, {V_vec[2]:.1f}] km/s")
+                print(f"[ICME BACKPROP]     Closest measurement: {times_common[idx_closest]} (Δt = {time_diffs[idx_closest]/60:.1f} min)")
+            else:
+                v_sw_kms = 400.0
+                print(f"[ICME BACKPROP]   ⚠️  Using default V_sw = {v_sw_kms:.1f} km/s (no SWA data available)")
+            
+            # Calculate propagation time
+            propagation_time_sec = distance_km / v_sw_kms
+            propagation_time_hrs = propagation_time_sec / 3600.0
+            print(f"[ICME BACKPROP]   Propagation time: {propagation_time_hrs:.1f} hours ({propagation_time_hrs/24:.2f} days)")
         
-        # Calculate propagation time
-        propagation_time_sec = distance_km / v_sw_kms
-        propagation_time_hrs = propagation_time_sec / 3600.0
         propagation_time_days = propagation_time_hrs / 24.0
-        
-        print(f"[ICME BACKPROP] Propagation time: {propagation_time_hrs:.1f} hours ({propagation_time_days:.2f} days)")
         
         # Predicted arrival time at Earth
         t_predicted_earth = t_crossover + timedelta(seconds=propagation_time_sec)
@@ -1200,7 +1241,6 @@ class CME_Catalogue:
         near_misses = []
         
         for i, icme in enumerate(icme_list, 1):
-            # Check if predicted arrival matches ICME arrival
             time_diff_start = abs(t_predicted_earth - icme['start'])
             time_diff_end = abs(t_predicted_earth - icme['end'])
             
@@ -1211,7 +1251,6 @@ class CME_Catalogue:
                 print(f"                Predicted arrival vs ICME start: {time_diff_start.total_seconds()/3600:.1f} hours")
                 print(f"                Predicted arrival vs ICME end:   {time_diff_end.total_seconds()/3600:.1f} hours")
                 
-                # Check matching criteria
                 within_duration = (icme['start'] - tolerance_td <= t_predicted_earth <= icme['end'] + tolerance_td)
                 near_start = (time_diff_start <= tolerance_td)
                 near_end = (time_diff_end <= tolerance_td)
@@ -1253,13 +1292,15 @@ class CME_Catalogue:
                     'comment': icme['comment'],
                     'distance_au': distance_au,
                     'propagation_hours': propagation_time_hrs,
-                    'v_sw_used': v_sw_kms
+                    'v_sw_used': v_sw_kms if not use_mvab else distance_km / propagation_time_sec,
+                    'method': 'MVAB' if use_mvab else 'Ballistic'
                 })
         
         print(f"\n{'─'*80}")
         
         if matched_icmes:
-            print(f"[ICME BACKPROP] ✓ Found {len(matched_icmes)} matching ICME(s)!")
+            method_str = "MVAB" if use_mvab else "Ballistic"
+            print(f"[ICME BACKPROP] ✓ Found {len(matched_icmes)} matching ICME(s) using {method_str} propagation!")
             for i, match in enumerate(matched_icmes, 1):
                 print(f"  {i}. {match['type']} @ Earth: {match['earth_start']} → {match['earth_end']}")
                 print(f"     @ S/C: {match['sc_start']} → {match['sc_end']}")
@@ -1269,7 +1310,7 @@ class CME_Catalogue:
             if near_misses:
                 print(f"\n[ICME BACKPROP] Near misses (within 5 days):")
                 near_misses.sort(key=lambda x: x['time_diff_hours'])
-                for nm in near_misses[:3]:  # Show top 3 near misses
+                for nm in near_misses[:3]:
                     icme = nm['icme']
                     print(f"  • {icme['start']} ({icme['type']}): missed by {nm['time_diff_hours']:.1f} hours")
             else:
@@ -2047,6 +2088,8 @@ class SoloDataLoader:
             kp_pred = None
             kp_shifted = None
             l1_shifted = None
+            l1_shifted_ballistic = None
+            l1_shifted_mvab = None
             common = None
 
             if mag and swam and ("V" in swam) and ("n" in swam):
@@ -2078,60 +2121,87 @@ class SoloDataLoader:
                         common, kp, spacecraft_ephemeris, epoch_date
                     )
 
+
                     if l1:
-                        # Choose propagation method
-                        if PROPAGATION_METHOD == "mvab":
-                            l1_shifted = MVABPropagation.apply_mvab_shift_to_l1(
+                        # Ballistic propagation (always compute if needed)
+                        if PROPAGATION_METHOD in ["flat", "both"]:
+                            l1_shifted_ballistic = BallisticPropagation.apply_ballistic_shift_to_l1(
+                                common, l1, spacecraft_ephemeris, epoch_date
+                            )
+                        
+                        # MVAB propagation (compute if requested)
+                        if PROPAGATION_METHOD in ["mvab", "both"]:
+                            l1_shifted_mvab = MVABPropagation.apply_mvab_shift_to_l1(
                                 common, l1, spacecraft_ephemeris, epoch_date,
                                 window_minutes=MVAB_WINDOW_MINUTES,
                                 quality_threshold=MVAB_QUALITY_MIN
                             )
-                            if l1_shifted is None:
-                                # Fallback to ballistic
-                                print("    MVAB failed, using ballistic fallback")
-                                l1_shifted = BallisticPropagation.apply_ballistic_shift_to_l1(
-                                    common, l1, spacecraft_ephemeris, epoch_date
-                                )
-                        else:
-                            # Use ballistic method
-                            l1_shifted = BallisticPropagation.apply_ballistic_shift_to_l1(
-                                common, l1, spacecraft_ephemeris, epoch_date
-                            )
-            
-            # Back-propagate ICMEs using measured velocity if available
-            icmes = None
+                            if l1_shifted_mvab is None:
+                                print("    ⚠️  MVAB failed for this event")
+                        
+                        # Decide which to use as primary L1 shifted data
+                        if PROPAGATION_METHOD == "flat":
+                            l1_shifted = l1_shifted_ballistic
+                        elif PROPAGATION_METHOD == "mvab":
+                            l1_shifted = l1_shifted_mvab if l1_shifted_mvab else l1_shifted_ballistic
+                        else:  # "both"
+                            l1_shifted = l1_shifted_ballistic  # Use ballistic as primary
+                            
+        
+            # Back-propagate ICMEs based on propagation method
+            icmes_ballistic = None
+            icmes_mvab = None
+
             if icme_catalogue:
                 print(f"\n[PRELOAD] Checking ICME catalogue for event at {t_ev}")
-                icmes = CME_Catalogue.backpropagate_icmes(
-                    event, spacecraft_ephemeris, epoch_date, icme_catalogue,
-                    common_data=common
-                )
-                if icmes:
-                    print(f"    ✓ Matched {len(icmes)} ICME(s)")
-                    for i, icme in enumerate(icmes, 1):
-                        print(f"      {i}. Earth: {icme['earth_start'].strftime('%b %d %H:%M')} → "
-                            f"{icme['earth_end'].strftime('%b %d %H:%M')} ({icme['type']})")
-                        print(f"         S/C:   {icme['sc_start'].strftime('%b %d %H:%M')} → "
-                            f"{icme['sc_end'].strftime('%b %d %H:%M')} "
-                            f"(Δt={icme['propagation_hours']:.1f} hrs)")
-                else:
-                    print(f"    No ICMEs matched")
+                
+                # Ballistic ICME propagation
+                if PROPAGATION_METHOD in ["flat", "both"]:
+                    print(f"[ICME] Computing ballistic propagation...")
+                    icmes_ballistic = CME_Catalogue.backpropagate_icmes(
+                        event, spacecraft_ephemeris, epoch_date, icme_catalogue,
+                        common_data=common,
+                        use_mvab=False
+                    )
+                    if icmes_ballistic:
+                        print(f"    ✓ Ballistic: Matched {len(icmes_ballistic)} ICME(s)")
+                    else:
+                        print(f"    ✗ Ballistic: No ICMEs matched")
+                
+                # MVAB ICME propagation
+                if PROPAGATION_METHOD in ["mvab", "both"]:
+                    print(f"[ICME] Computing MVAB propagation...")
+                    if l1_shifted_mvab:
+                        icmes_mvab = CME_Catalogue.backpropagate_icmes(
+                            event, spacecraft_ephemeris, epoch_date, icme_catalogue,
+                            common_data=common,
+                            use_mvab=True,
+                            mvab_data=l1_shifted_mvab
+                        )
+                        if icmes_mvab:
+                            print(f"    ✓ MVAB: Matched {len(icmes_mvab)} ICME(s)")
+                        else:
+                            print(f"    ✗ MVAB: No ICMEs matched")
+                    else:
+                        print(f"    ⚠️  MVAB: Cannot compute (no MVAB L1 data)")
 
             all_data[t_ev] = {
-                "mag":           mag,
-                "swa":           swae,
-                "swa_moments":   swam,
-                "dst_measured":  dst,
-                "dst_predicted": dst_pred,
-                "dst_shifted":   dst_shifted,
-                "kp_measured":   kp,
-                "kp_predicted":  kp_pred,
-                "kp_shifted":    kp_shifted,
-                "l1_data":       l1,
-                "l1_shifted":    l1_shifted,
-                "icmes":         icmes,
+                "mag":                mag,
+                "swa":                swae,
+                "swa_moments":        swam,
+                "dst_measured":       dst,
+                "dst_predicted":      dst_pred,
+                "dst_shifted":        dst_shifted,
+                "kp_measured":        kp,
+                "kp_predicted":       kp_pred,
+                "kp_shifted":         kp_shifted,
+                "l1_data":            l1,
+                "l1_shifted":         l1_shifted,
+                "l1_shifted_mvab":    l1_shifted_mvab,      # Store both
+                "l1_shifted_ballistic": l1_shifted_ballistic,
+                "icmes_ballistic":    icmes_ballistic,       # Store both ICME results
+                "icmes_mvab":         icmes_mvab,
             }
-
         return all_data
 
 # ------------------------ STEREO in-situ loaders -------------------------- #
@@ -2720,6 +2790,8 @@ class STEREODataLoader:
             kp_pred = None
             kp_shifted = None
             l1_shifted = None
+            l1_shifted_ballistic = None
+            l1_shifted_mvab = None
             common = None
             
             if mag and plasma and ("V" in plasma) and ("n" in plasma):
@@ -2757,27 +2829,32 @@ class STEREODataLoader:
                         )
             
             # Back-propagate ICMEs
-            icmes = None
+            # Back-propagate ICMEs based on propagation method
+            icmes_ballistic = None
+            icmes_mvab = None
+
             if icme_catalogue:
                 print(f"\n[PRELOAD] Checking ICME catalogue for event at {t_ev}")
-                icmes = CME_Catalogue.backpropagate_icmes(
+                
+                # Ballistic ICME propagation (always compute for STEREO)
+                print(f"[ICME] Computing ballistic propagation...")
+                icmes_ballistic = CME_Catalogue.backpropagate_icmes(
                     event, spacecraft_ephemeris, epoch_date, icme_catalogue,
-                    common_data=common
+                    common_data=common,
+                    use_mvab=False
                 )
-                if icmes:
-                    print(f"Matched {len(icmes)} ICME(s)")
-                    for i, icme in enumerate(icmes, 1):
-                        print(f"      {i}. Earth: {icme['earth_start'].strftime('%b %d %H:%M')} → "
-                              f"{icme['earth_end'].strftime('%b %d %H:%M')} ({icme['type']})")
-                        print(f"         S/C:   {icme['sc_start'].strftime('%b %d %H:%M')} → "
-                              f"{icme['sc_end'].strftime('%b %d %H:%M')} "
-                              f"(Δt={icme['propagation_hours']:.1f} hrs)")
+                if icmes_ballistic:
+                    print(f"    ✓ Ballistic: Matched {len(icmes_ballistic)} ICME(s)")
                 else:
-                    print(f"    No ICMEs matched")
-            
+                    print(f"    ✗ Ballistic: No ICMEs matched")
+                
+                # MVAB for STEREO not yet implemented (no MVAB L1 shifting)
+                if PROPAGATION_METHOD in ["mvab", "both"]:
+                    print(f"    ⚠️  MVAB ICME propagation not implemented for STEREO (no MVAB L1 data)")
+
             all_data[t_ev] = {
                 "mag": mag,
-                "swa": eflux,  # Store eflux in same key for compatibility
+                "swa": eflux,
                 "swa_moments": plasma,
                 "dst_measured": dst,
                 "dst_predicted": dst_pred,
@@ -2787,7 +2864,8 @@ class STEREODataLoader:
                 "kp_shifted": kp_shifted,
                 "l1_data": l1,
                 "l1_shifted": l1_shifted,
-                "icmes": icmes,
+                "icmes_ballistic": icmes_ballistic,
+                "icmes_mvab": icmes_mvab,
             }
         
         return all_data
@@ -3062,11 +3140,27 @@ class Plotter:
         return fig
 
     @staticmethod
-    def _add_icme_shading(axes, icmes, t0, t1):
+    def _add_icme_shading(axes, icmes, t0, t1, base_color='red', label_suffix=''):
+        """
+        Add ICME shading to plot axes.
+        
+        Args:
+            axes: List of matplotlib axes to add shading to
+            icmes: List of ICME dictionaries
+            t0, t1: Time bounds for filtering
+            base_color: Base color for shading ('red' for ballistic, 'blue' for MVAB)
+            label_suffix: Suffix for ICME labels (e.g., ' (Ballistic)', ' (MVAB)')
+        """
         if not icmes:
             return
         
-        icme_colors = ['red', 'orange', 'purple', 'brown', 'pink']
+        # Color variations based on base color
+        if base_color == 'red':
+            icme_colors = ['red', 'orange', 'darkred', 'coral', 'indianred']
+        elif base_color == 'blue':
+            icme_colors = ['blue', 'dodgerblue', 'darkblue', 'steelblue', 'cornflowerblue']
+        else:
+            icme_colors = [base_color]
         
         for i, icme in enumerate(icmes):
             color = icme_colors[i % len(icme_colors)]
@@ -3083,7 +3177,8 @@ class Plotter:
             
             mid_time = sc_start + (sc_end - sc_start) / 2
             y_pos = axes[0].get_ylim()[1] * (0.95 - i * 0.08)
-            axes[0].text(mid_time, y_pos, f"ICME {i+1}: {icme['type']}", ha='center', va='top', fontsize=7,
+            label_text = f"ICME {i+1}: {icme['type']}{label_suffix}"
+            axes[0].text(mid_time, y_pos, label_text, ha='center', va='top', fontsize=7,
                         bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor=color))
 
     @staticmethod
@@ -3107,7 +3202,10 @@ class Plotter:
         kp_pred = d.get("kp_predicted")
         kp_shifted = d.get("kp_shifted")
         l1_shifted = d.get("l1_shifted")
-        icmes = d.get("icmes")
+        
+        # Get ICME data based on propagation method
+        icmes_ballistic = d.get("icmes_ballistic")
+        icmes_mvab = d.get("icmes_mvab")
 
         if not mag or "time" not in mag or "B" not in mag:
             return None
@@ -3134,19 +3232,48 @@ class Plotter:
         from matplotlib.gridspec import GridSpec
         from matplotlib.dates import DateFormatter, AutoDateLocator
 
+        # =====================================================================
+        # FIGURE 1: IN-SITU DATA (|B|, Br, Bt, Bn, n, V, T)
+        # =====================================================================
+        fig1 = plt.figure(figsize=(14, 14))
+        gs1 = GridSpec(7, 1, figure=fig1, hspace=0.08)
+        ax_insitu = [fig1.add_subplot(gs1[i, 0]) for i in range(7)]
+
+        # Add ICME shading to all in-situ panels
+        if PROPAGATION_METHOD == "flat" and icmes_ballistic:
+            Plotter._add_icme_shading(ax_insitu, icmes_ballistic, t0, t1, base_color='red', label_suffix='')
+        elif PROPAGATION_METHOD == "mvab" and icmes_mvab:
+            Plotter._add_icme_shading(ax_insitu, icmes_mvab, t0, t1, base_color='blue', label_suffix='')
+        elif PROPAGATION_METHOD == "both":
+            if icmes_ballistic:
+                Plotter._add_icme_shading(ax_insitu, icmes_ballistic, t0, t1, base_color='red', label_suffix=' (Ballistic)')
+            if icmes_mvab:
+                Plotter._add_icme_shading(ax_insitu, icmes_mvab, t0, t1, base_color='blue', label_suffix=' (MVAB)')
+
+        # Panel 0: |B| (magnitude)
+        b_mag = np.linalg.norm(b, axis=1)
+        ax_insitu[0].plot(t_mag, b_mag, linewidth=1.2, color='black', label=f"{spacecraft_name} |B|")
         
-        fig1 = plt.figure(figsize=(14, 10))
-        gs1 = GridSpec(3, 1, figure=fig1, hspace=0.15)
-        ax_b = [fig1.add_subplot(gs1[i, 0]) for i in range(3)]
+        if l1_shifted and "B_gse_shifted" in l1_shifted:
+            b_l1 = l1_shifted["B_gse_shifted"]
+            t_l1_full = ensure_datetime_array(l1_shifted["time"])
+            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+            if np.any(mask_l1):
+                t_l1 = t_l1_full[mask_l1]
+                b_l1_mag = np.linalg.norm(b_l1[mask_l1], axis=1)
+                ax_insitu[0].plot(t_l1, b_l1_mag, linewidth=1.0, color='gray', linestyle=':', alpha=0.7, label="L1 |B| (shifted)")
+        
+        ax_insitu[0].set_ylabel("|B| [nT]", fontsize=11, fontweight='bold')
+        ax_insitu[0].grid(True, alpha=0.3)
+        ax_insitu[0].legend(loc="upper right", fontsize=8)
+        ax_insitu[0].set_ylim(bottom=0)
 
-        if icmes:
-            Plotter._add_icme_shading(ax_b, icmes, t0, t1)
-
+        # Panels 1-3: Br, Bt, Bn
         b_labels = ["Br", "Bt", "Bn"]
         b_colors = ["red", "green", "blue"]
 
         for i in range(min(3, b.shape[1])):
-            ax_b[i].plot(t_mag, b[:, i], linewidth=1.2, color=b_colors[i], label=f"{spacecraft_name} B{b_labels[i]}")
+            ax_insitu[i+1].plot(t_mag, b[:, i], linewidth=1.2, color=b_colors[i], label=f"{spacecraft_name} B{b_labels[i]}")
             
             if l1_shifted and "B_gse_shifted" in l1_shifted:
                 b_l1 = l1_shifted["B_gse_shifted"]
@@ -3155,36 +3282,128 @@ class Plotter:
                 if np.any(mask_l1) and b_l1.shape[1] > i:
                     t_l1 = t_l1_full[mask_l1]
                     b_l1_i = b_l1[mask_l1, i]
-                    ax_b[i].plot(t_l1, b_l1_i, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label=f"L1 B{b_labels[i]} (shifted)")
+                    ax_insitu[i+1].plot(t_l1, b_l1_i, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label=f"L1 B{b_labels[i]} (shifted)")
             
-            ax_b[i].set_ylabel(f"B{b_labels[i]} [nT]", fontsize=11)
-            ax_b[i].grid(True, alpha=0.3)
-            ax_b[i].legend(loc="upper right", fontsize=8)
-            ax_b[i].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
+            ax_insitu[i+1].set_ylabel(f"B{b_labels[i]} [nT]", fontsize=11, fontweight='bold')
+            ax_insitu[i+1].grid(True, alpha=0.3)
+            ax_insitu[i+1].legend(loc="upper right", fontsize=8)
+            ax_insitu[i+1].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
 
-        ax_b[-1].set_xlabel("Time (UTC)", fontsize=11)
+        # Panel 4: Density (n)
+        if swa_moments and "n" in swa_moments:
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+            if np.any(mask_swa):
+                t_swa = t_swa_full[mask_swa]
+                n_data = np.array(swa_moments["n"])[mask_swa]
+                ax_insitu[4].plot(t_swa, n_data, linewidth=1.2, color="orange", label=f"{spacecraft_name} n")
+                
+                if l1_shifted and "n_shifted" in l1_shifted:
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+                    if np.any(mask_l1):
+                        t_l1 = t_l1_full[mask_l1]
+                        n_l1_data = np.array(l1_shifted["n_shifted"])[mask_l1]
+                        ax_insitu[4].plot(t_l1, n_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 n (shifted)")
+                
+                ax_insitu[4].set_ylabel("n [cm⁻³]", fontsize=11, fontweight='bold')
+                ax_insitu[4].legend(loc="upper right", fontsize=8)
+                ax_insitu[4].set_ylim(bottom=0)
+            else:
+                ax_insitu[4].text(0.5, 0.5, "No n in window", ha="center", va="center", transform=ax_insitu[4].transAxes, fontsize=10)
+        else:
+            ax_insitu[4].text(0.5, 0.5, "No n", ha="center", va="center", transform=ax_insitu[4].transAxes, fontsize=10)
+        ax_insitu[4].grid(True, alpha=0.3)
+
+        # Panel 5: Velocity (V)
+        if swa_moments and "V" in swa_moments:
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+            if np.any(mask_swa):
+                t_swa = t_swa_full[mask_swa]
+                v_data = np.array(swa_moments["V"])[mask_swa]
+                v_mag = np.linalg.norm(v_data, axis=1)
+                ax_insitu[5].plot(t_swa, v_mag, linewidth=1.2, color="cyan", label=f"{spacecraft_name} V")
+                
+                if l1_shifted and "V_shifted" in l1_shifted:
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+                    if np.any(mask_l1):
+                        t_l1 = t_l1_full[mask_l1]
+                        v_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
+                        v_l1_mag = np.linalg.norm(v_l1, axis=1)
+                        ax_insitu[5].plot(t_l1, v_l1_mag, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 V (shifted)")
+                
+                ax_insitu[5].set_ylabel("V [km/s]", fontsize=11, fontweight='bold')
+                ax_insitu[5].legend(loc="upper right", fontsize=8)
+                ax_insitu[5].set_ylim(bottom=0)
+            else:
+                ax_insitu[5].text(0.5, 0.5, "No V in window", ha="center", va="center", transform=ax_insitu[5].transAxes, fontsize=10)
+        else:
+            ax_insitu[5].text(0.5, 0.5, "No V", ha="center", va="center", transform=ax_insitu[5].transAxes, fontsize=10)
+        ax_insitu[5].grid(True, alpha=0.3)
+
+        # Panel 6: Temperature (T)
+        if swa_moments and "T" in swa_moments:
+            t_swa_full = ensure_datetime_array(swa_moments["time"])
+            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+            if np.any(mask_swa):
+                t_swa = t_swa_full[mask_swa]
+                t_data = np.array(swa_moments["T"])[mask_swa]
+                ax_insitu[6].plot(t_swa, t_data, linewidth=1.2, color="purple", label=f"{spacecraft_name} T")
+                
+                if l1_shifted and "T_shifted" in l1_shifted:
+                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
+                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+                    if np.any(mask_l1):
+                        t_l1 = t_l1_full[mask_l1]
+                        t_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
+                        ax_insitu[6].plot(t_l1, t_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 T (shifted)")
+                
+                ax_insitu[6].set_ylabel("T [eV]", fontsize=11, fontweight='bold')
+                ax_insitu[6].legend(loc="upper right", fontsize=8)
+                ax_insitu[6].set_ylim(bottom=0)
+            else:
+                ax_insitu[6].text(0.5, 0.5, "No T in window", ha="center", va="center", transform=ax_insitu[6].transAxes, fontsize=10)
+        else:
+            ax_insitu[6].text(0.5, 0.5, "No T", ha="center", va="center", transform=ax_insitu[6].transAxes, fontsize=10)
+        ax_insitu[6].grid(True, alpha=0.3)
+
+        # Format x-axis (only on bottom panel)
+        ax_insitu[-1].set_xlabel("Time (UTC)", fontsize=11)
         locator = AutoDateLocator()
         formatter = DateFormatter("%Y-%b-%d\n%H:%M")
-        ax_b[-1].xaxis.set_major_locator(locator)
-        ax_b[-1].xaxis.set_major_formatter(formatter)
-        ax_b[-1].set_xlim(t_mag[0], t_mag[-1])
+        ax_insitu[-1].xaxis.set_major_locator(locator)
+        ax_insitu[-1].xaxis.set_major_formatter(formatter)
+        ax_insitu[-1].set_xlim(t_mag[0], t_mag[-1])
         
-        for i in range(2):
-            ax_b[i].sharex(ax_b[2])
-            ax_b[i].tick_params(labelbottom=False)
+        # Share x-axis for all panels
+        for i in range(6):
+            ax_insitu[i].sharex(ax_insitu[6])
+            ax_insitu[i].tick_params(labelbottom=False)
 
-        plt.suptitle(f"{spacecraft_name} B-Field — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
+        plt.suptitle(f"{spacecraft_name} In-Situ Measurements — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
         fig1.autofmt_xdate()
 
-        
+        # =====================================================================
+        # FIGURE 2: CONTEXT DATA (Eflux, Dst, Kp, Distance&Angle)
+        # =====================================================================
         fig2 = plt.figure(figsize=(14, 12))
-        gs2 = GridSpec(4, 1, figure=fig2, hspace=0.15)
-        ax_plasma = [fig2.add_subplot(gs2[i, 0]) for i in range(4)]
+        gs2 = GridSpec(4, 1, figure=fig2, hspace=0.12)
+        ax_context = [fig2.add_subplot(gs2[i, 0]) for i in range(4)]
 
-        if icmes:
-            Plotter._add_icme_shading(ax_plasma, icmes, t0, t1)
+        # Add ICME shading to context panels
+        if PROPAGATION_METHOD == "flat" and icmes_ballistic:
+            Plotter._add_icme_shading(ax_context, icmes_ballistic, t0, t1, base_color='red', label_suffix='')
+        elif PROPAGATION_METHOD == "mvab" and icmes_mvab:
+            Plotter._add_icme_shading(ax_context, icmes_mvab, t0, t1, base_color='blue', label_suffix='')
+        elif PROPAGATION_METHOD == "both":
+            if icmes_ballistic:
+                Plotter._add_icme_shading(ax_context, icmes_ballistic, t0, t1, base_color='red', label_suffix=' (Ballistic)')
+            if icmes_mvab:
+                Plotter._add_icme_shading(ax_context, icmes_mvab, t0, t1, base_color='blue', label_suffix=' (MVAB)')
 
-        # Eflux
+        # Panel 0: Eflux
         if swa and "eflux" in swa and swa.get("eflux") is not None:
             from matplotlib.dates import date2num
             import matplotlib.colors as mcolors
@@ -3201,159 +3420,72 @@ class Plotter:
                     times_mpl = date2num(t_ef)
                     t_mesh, e_mesh = np.meshgrid(times_mpl, energy)
 
-                    pcm = ax_plasma[0].pcolormesh(t_mesh, e_mesh, eflux.T, shading="auto", cmap="jet", norm=mcolors.LogNorm(vmin=1e5, vmax=1e10))
-                    ax_plasma[0].set_yscale("log")
-                    ax_plasma[0].set_ylabel("Energy [eV]", fontsize=11)
-                    ax_plasma[0].set_ylim([100, 2e4])
+                    pcm = ax_context[0].pcolormesh(t_mesh, e_mesh, eflux.T, shading="auto", cmap="jet", 
+                                                   norm=mcolors.LogNorm(vmin=1e5, vmax=1e10))
+                    ax_context[0].set_yscale("log")
+                    ax_context[0].set_ylabel("Energy [eV]", fontsize=11, fontweight='bold')
+                    ax_context[0].set_ylim([100, 2e4])
 
-                    pos = ax_plasma[0].get_position()
+                    pos = ax_context[0].get_position()
                     cax = fig2.add_axes([pos.x1 + 0.01, pos.y0, 0.015, pos.height])
                     cbar = fig2.colorbar(pcm, cax=cax)
-                    cbar.set_label(r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]", rotation=270, labelpad=20)
+                    cbar.set_label(r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]", rotation=270, labelpad=20, fontsize=9)
                 else:
-                    ax_plasma[0].text(0.5, 0.5, "No 2D eflux", ha="center", va="center", transform=ax_plasma[0].transAxes)
+                    ax_context[0].text(0.5, 0.5, "No 2D eflux", ha="center", va="center", 
+                                      transform=ax_context[0].transAxes, fontsize=10)
             else:
-                ax_plasma[0].text(0.5, 0.5, "No Eflux in window", ha="center", va="center", transform=ax_plasma[0].transAxes)
+                ax_context[0].text(0.5, 0.5, "No Eflux in window", ha="center", va="center", 
+                                  transform=ax_context[0].transAxes, fontsize=10)
         else:
-            ax_plasma[0].text(0.5, 0.5, "No Eflux", ha="center", va="center", transform=ax_plasma[0].transAxes)
-        ax_plasma[0].grid(True, alpha=0.3)
+            ax_context[0].text(0.5, 0.5, "No Eflux", ha="center", va="center", 
+                              transform=ax_context[0].transAxes, fontsize=10)
+        ax_context[0].grid(True, alpha=0.3)
 
-        # Temperature
-        if swa_moments and "T" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                t_data = np.array(swa_moments["T"])[mask_swa]
-                ax_plasma[1].plot(t_swa, t_data, linewidth=1.2, color="purple", label=f"{spacecraft_name} T")
-                
-                if l1_shifted and "T_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        t_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
-                        ax_plasma[1].plot(t_l1, t_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 T (shifted)")
-                
-                ax_plasma[1].set_ylabel("T [eV]", fontsize=11)
-                ax_plasma[1].legend(loc="upper right", fontsize=8)
-            else:
-                ax_plasma[1].text(0.5, 0.5, "No T in window", ha="center", va="center", transform=ax_plasma[1].transAxes)
-        else:
-            ax_plasma[1].text(0.5, 0.5, "No T", ha="center", va="center", transform=ax_plasma[1].transAxes)
-        ax_plasma[1].grid(True, alpha=0.3)
-
-        # Density
-        if swa_moments and "n" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                n_data = np.array(swa_moments["n"])[mask_swa]
-                ax_plasma[2].plot(t_swa, n_data, linewidth=1.2, color="orange", label=f"{spacecraft_name} n")
-                
-                if l1_shifted and "n_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        n_l1_data = np.array(l1_shifted["n_shifted"])[mask_l1]
-                        ax_plasma[2].plot(t_l1, n_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 n (shifted)")
-                
-                ax_plasma[2].set_ylabel("n [cm⁻³]", fontsize=11)
-                ax_plasma[2].legend(loc="upper right", fontsize=8)
-            else:
-                ax_plasma[2].text(0.5, 0.5, "No n in window", ha="center", va="center", transform=ax_plasma[2].transAxes)
-        else:
-            ax_plasma[2].text(0.5, 0.5, "No n", ha="center", va="center", transform=ax_plasma[2].transAxes)
-        ax_plasma[2].grid(True, alpha=0.3)
-
-        # Velocity
-        if swa_moments and "V" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                v_data = np.array(swa_moments["V"])[mask_swa]
-                v_mag = np.linalg.norm(v_data, axis=1)
-                ax_plasma[3].plot(t_swa, v_mag, linewidth=1.2, color="cyan", label=f"{spacecraft_name} V")
-                
-                if l1_shifted and "V_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        v_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
-                        v_l1_mag = np.linalg.norm(v_l1, axis=1)
-                        ax_plasma[3].plot(t_l1, v_l1_mag, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 V (shifted)")
-                
-                ax_plasma[3].set_ylabel("V [km/s]", fontsize=11)
-                ax_plasma[3].legend(loc="upper right", fontsize=8)
-            else:
-                ax_plasma[3].text(0.5, 0.5, "No V in window", ha="center", va="center", transform=ax_plasma[3].transAxes)
-        else:
-            ax_plasma[3].text(0.5, 0.5, "No V", ha="center", va="center", transform=ax_plasma[3].transAxes)
-        ax_plasma[3].grid(True, alpha=0.3)
-
-        ax_plasma[-1].set_xlabel("Time (UTC)", fontsize=11)
-        ax_plasma[-1].xaxis.set_major_locator(locator)
-        ax_plasma[-1].xaxis.set_major_formatter(formatter)
-        ax_plasma[-1].set_xlim(t_mag[0], t_mag[-1])
-        
-        for i in range(3):
-            ax_plasma[i].sharex(ax_plasma[3])
-            ax_plasma[i].tick_params(labelbottom=False)
-
-        plt.suptitle(f"{spacecraft_name} Plasma Parameters — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
-        fig2.autofmt_xdate()
-
-        
-        fig3 = plt.figure(figsize=(14, 10))
-        gs3 = GridSpec(3, 1, figure=fig3, hspace=0.15)
-        ax_geo = [fig3.add_subplot(gs3[i, 0]) for i in range(3)]
-
-        if icmes:
-            Plotter._add_icme_shading(ax_geo, icmes, t0, t1)
-
-        # Dst
+        # Panel 1: Dst
         has_dst = False
         if dst_shifted:
-            ax_geo[0].plot(dst_shifted["time"], dst_shifted["dst_shifted"], linewidth=1.5, color="blue", label="Measured Dst (Time-Shifted)", alpha=0.8)
+            ax_context[1].plot(dst_shifted["time"], dst_shifted["dst_shifted"], linewidth=1.5, 
+                             color="blue", label="Measured Dst (Time-Shifted)", alpha=0.8)
             has_dst = True
         if dst_pred:
-            ax_geo[0].plot(dst_pred["time"], dst_pred["dst_predicted"], linewidth=1.5, color="red", linestyle="--", label="Predicted Dst (Crossover)", alpha=0.8)
+            ax_context[1].plot(dst_pred["time"], dst_pred["dst_predicted"], linewidth=1.5, 
+                             color="red", linestyle="--", label="Predicted Dst (Crossover)", alpha=0.8)
             has_dst = True
 
         if has_dst:
-            ax_geo[0].set_ylabel("Dst [nT]", fontsize=11)
-            ax_geo[0].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
-            ax_geo[0].axhline(-50, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Moderate storm")
-            ax_geo[0].axhline(-100, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
-            ax_geo[0].legend(loc="upper right", fontsize=8)
+            ax_context[1].set_ylabel("Dst [nT]", fontsize=11, fontweight='bold')
+            ax_context[1].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
+            ax_context[1].axhline(-50, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Moderate storm")
+            ax_context[1].axhline(-100, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
+            ax_context[1].legend(loc="upper right", fontsize=8)
         else:
-            ax_geo[0].text(0.5, 0.5, "No Dst", ha="center", va="center", transform=ax_geo[0].transAxes)
-        ax_geo[0].grid(True, alpha=0.3)
+            ax_context[1].text(0.5, 0.5, "No Dst", ha="center", va="center", 
+                              transform=ax_context[1].transAxes, fontsize=10)
+        ax_context[1].grid(True, alpha=0.3)
 
-        # Kp
+        # Panel 2: Kp
         has_kp = False
         if kp_shifted:
-            ax_geo[1].plot(kp_shifted["time"], kp_shifted["kp_shifted"], linewidth=1.5, color="blue", label="Measured Kp (Time-Shifted)", alpha=0.8)
+            ax_context[2].plot(kp_shifted["time"], kp_shifted["kp_shifted"], linewidth=1.5, 
+                             color="blue", label="Measured Kp (Time-Shifted)", alpha=0.8)
             has_kp = True
         if kp_pred:
-            ax_geo[1].plot(kp_pred["time"], kp_pred["kp_predicted"], linewidth=1.5, color="red", linestyle="--", label="Predicted Kp (Crossover)", alpha=0.8)
+            ax_context[2].plot(kp_pred["time"], kp_pred["kp_predicted"], linewidth=1.5, 
+                             color="red", linestyle="--", label="Predicted Kp (Crossover)", alpha=0.8)
             has_kp = True
 
         if has_kp:
-            ax_geo[1].set_ylabel("Kp", fontsize=11)
-            ax_geo[1].set_ylim([0, 9])
-            ax_geo[1].axhline(5, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Storm threshold")
-            ax_geo[1].axhline(7, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
-            ax_geo[1].legend(loc="upper right", fontsize=8)
+            ax_context[2].set_ylabel("Kp", fontsize=11, fontweight='bold')
+            ax_context[2].set_ylim([0, 9])
+            ax_context[2].axhline(5, color="orange", linestyle="--", alpha=0.3, linewidth=0.8, label="Storm threshold")
+            ax_context[2].axhline(7, color="red", linestyle="--", alpha=0.3, linewidth=0.8, label="Strong storm")
+            ax_context[2].legend(loc="upper right", fontsize=8)
         else:
-            ax_geo[1].text(0.5, 0.5, "No Kp", ha="center", va="center", transform=ax_geo[1].transAxes)
-        ax_geo[1].grid(True, alpha=0.3)
+            ax_context[2].text(0.5, 0.5, "No Kp", ha="center", va="center", 
+                              transform=ax_context[2].transAxes, fontsize=10)
+        ax_context[2].grid(True, alpha=0.3)
 
-        # Position (Distance + Angle)
+        # Panel 3: Position (Distance + Angle)
         sc_times = spacecraft_ephemeris["times"]
         sc_positions = spacecraft_ephemeris["positions"]
         
@@ -3377,57 +3509,57 @@ class Plotter:
             
             angles = np.array(angles)
             
-            ax_geo[2].plot(t_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
-            ax_geo[2].set_ylabel('Distance [AU]', color='k', fontsize=11)
-            ax_geo[2].tick_params(axis='y', labelcolor='k')
-            ax_geo[2].grid(True, alpha=0.3)
+            ax_context[3].plot(t_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
+            ax_context[3].set_ylabel('Distance [AU]', color='k', fontsize=11, fontweight='bold')
+            ax_context[3].tick_params(axis='y', labelcolor='k')
+            ax_context[3].grid(True, alpha=0.3)
+            ax_context[3].set_ylim(bottom=0)
             
-            ax_angle = ax_geo[2].twinx()
+            ax_angle = ax_context[3].twinx()
             ax_angle.plot(t_sc, angles, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
-            ax_angle.set_ylabel('Angle [deg]', color='r', fontsize=11)
+            ax_angle.set_ylabel('Angle [deg]', color='r', fontsize=11, fontweight='bold')
             ax_angle.tick_params(axis='y', labelcolor='r')
+            ax_angle.set_ylim([0, 180])
             
-            lines1, labels1 = ax_geo[2].get_legend_handles_labels()
+            lines1, labels1 = ax_context[3].get_legend_handles_labels()
             lines2, labels2 = ax_angle.get_legend_handles_labels()
-            ax_geo[2].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+            ax_context[3].legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
         else:
-            ax_geo[2].text(0.5, 0.5, "No ephemeris in window", ha="center", va="center", transform=ax_geo[2].transAxes)
-            ax_geo[2].grid(True, alpha=0.3)
+            ax_context[3].text(0.5, 0.5, "No ephemeris in window", ha="center", va="center", 
+                              transform=ax_context[3].transAxes, fontsize=10)
+            ax_context[3].grid(True, alpha=0.3)
 
-        ax_geo[-1].set_xlabel("Time (UTC)", fontsize=11)
-        ax_geo[-1].xaxis.set_major_locator(locator)
-        ax_geo[-1].xaxis.set_major_formatter(formatter)
-        ax_geo[-1].set_xlim(t_mag[0], t_mag[-1])
+        # Format x-axis (only on bottom panel)
+        ax_context[-1].set_xlabel("Time (UTC)", fontsize=11)
+        ax_context[-1].xaxis.set_major_locator(locator)
+        ax_context[-1].xaxis.set_major_formatter(formatter)
+        ax_context[-1].set_xlim(t_mag[0], t_mag[-1])
         
-        for i in range(2):
-            ax_geo[i].sharex(ax_geo[2])
-            ax_geo[i].tick_params(labelbottom=False)
+        # Share x-axis for all panels
+        for i in range(3):
+            ax_context[i].sharex(ax_context[3])
+            ax_context[i].tick_params(labelbottom=False)
 
-        plt.suptitle(f"{spacecraft_name} Geomagnetic Indices & Position — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
-        fig3.autofmt_xdate()
+        plt.suptitle(f"{spacecraft_name} Context Data — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
+        fig2.autofmt_xdate()
         plt.tight_layout()
 
+        # Save figures
         if output_folder:
             safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
             timestamp = center.strftime('%Y%m%d')
             
-            filepath1 = os.path.join(output_folder, f"bfield_{safe_sc_name}_{timestamp}.png")
+            filepath1 = os.path.join(output_folder, f"insitu_{safe_sc_name}_{timestamp}.png")
             fig1.savefig(filepath1, dpi=300, bbox_inches='tight')
             print(f"  Saved: {filepath1}")
             plt.close(fig1)
             
-            filepath2 = os.path.join(output_folder, f"plasma_{safe_sc_name}_{timestamp}.png")
+            filepath2 = os.path.join(output_folder, f"context_{safe_sc_name}_{timestamp}.png")
             fig2.savefig(filepath2, dpi=300, bbox_inches='tight')
             print(f"  Saved: {filepath2}")
             plt.close(fig2)
-            
-            filepath3 = os.path.join(output_folder, f"geomag_{safe_sc_name}_{timestamp}.png")
-            fig3.savefig(filepath3, dpi=300, bbox_inches='tight')
-            print(f"  Saved: {filepath3}")
-            plt.close(fig3)
 
-        return fig1, fig2, fig3
-
+        return fig1, fig2
 # ------------------------------ Main driver ----------------------------- #
 
 def main():
