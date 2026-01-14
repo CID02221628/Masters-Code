@@ -192,10 +192,10 @@ MVAB_WINDOW_MINUTES = 30     # Time window for MVAB analysis
 MVAB_QUALITY_MIN = 3.0       # Minimum eigenvalue ratio (λ_max/λ_min)
 
 EVENT_LIMIT = {
-    "STEREO-A": None,
-    "Solar Orbiter": None,
-    "Parker Solar Probe": None,
-    "STEREO-B": None,
+    "STEREO-A": 3,
+    "Solar Orbiter": 3,
+    "Parker Solar Probe": 3,
+    "STEREO-B": 3,
 }
 
 WRITE_EVENTS_CSV = True
@@ -2871,8 +2871,107 @@ class STEREODataLoader:
         return all_data
     
 # ------------------------------- Plotting -------------------------------- #
+# ------------------------------- Plotting -------------------------------- #
 
 class Plotter:
+
+    @staticmethod
+    def average_to_5min_bins(times_dt, values, is_vector=False):
+        """
+        Average data to 5-minute bins.
+        
+        Args:
+            times_dt: Array of datetime objects
+            values: Array of data values (1D for scalar, 2D for vector)
+            is_vector: If True, values is [N×3] array; if False, 1D array
+        
+        Returns:
+            {"time": averaged times, "data": averaged values}
+        """
+        if len(times_dt) == 0:
+            return {"time": np.array([]), "data": np.array([])}
+        
+        # Convert to numpy array
+        times_dt = np.array(times_dt)
+        values = np.array(values)
+        
+        # Create 5-minute bins starting from first timestamp
+        start_time = times_dt[0].replace(minute=(times_dt[0].minute // 5) * 5, 
+                                         second=0, microsecond=0)
+        end_time = times_dt[-1]
+        
+        bin_times = []
+        bin_values = []
+        
+        current_bin_start = start_time
+        while current_bin_start <= end_time:
+            current_bin_end = current_bin_start + timedelta(minutes=5)
+            
+            # Find data points in this bin
+            mask = (times_dt >= current_bin_start) & (times_dt < current_bin_end)
+            
+            if np.any(mask):
+                if is_vector:
+                    # Average each component separately, handling NaNs
+                    bin_avg = np.nanmean(values[mask], axis=0)
+                else:
+                    # Average scalar, handling NaNs
+                    bin_avg = np.nanmean(values[mask])
+                
+                bin_values.append(bin_avg)
+                # Use bin center as timestamp
+                bin_times.append(current_bin_start + timedelta(minutes=2.5))
+            
+            current_bin_start = current_bin_end
+        
+        return {
+            "time": np.array(bin_times),
+            "data": np.array(bin_values)
+        }
+    
+    @staticmethod
+    def average_spectrogram_to_5min(times_dt, eflux_2d):
+        """
+        Average 2D spectrogram data to 5-minute bins.
+        
+        Args:
+            times_dt: Array of datetime objects [N]
+            eflux_2d: 2D array [N × E] where E is number of energy bins
+        
+        Returns:
+            {"time": averaged times, "eflux": averaged 2D array}
+        """
+        if len(times_dt) == 0 or eflux_2d.size == 0:
+            return {"time": np.array([]), "eflux": np.array([])}
+        
+        times_dt = np.array(times_dt)
+        eflux_2d = np.array(eflux_2d)
+        
+        start_time = times_dt[0].replace(minute=(times_dt[0].minute // 5) * 5,
+                                         second=0, microsecond=0)
+        end_time = times_dt[-1]
+        
+        bin_times = []
+        bin_eflux = []
+        
+        current_bin_start = start_time
+        while current_bin_start <= end_time:
+            current_bin_end = current_bin_start + timedelta(minutes=5)
+            
+            mask = (times_dt >= current_bin_start) & (times_dt < current_bin_end)
+            
+            if np.any(mask):
+                # Average along time axis for each energy bin
+                bin_avg = np.nanmean(eflux_2d[mask], axis=0)
+                bin_eflux.append(bin_avg)
+                bin_times.append(current_bin_start + timedelta(minutes=2.5))
+            
+            current_bin_start = current_bin_end
+        
+        return {
+            "time": np.array(bin_times),
+            "eflux": np.array(bin_eflux)
+        }
 
     @staticmethod
     def plot_constellation_overview(events, constellation, output_folder=None):
@@ -3210,24 +3309,206 @@ class Plotter:
         if not mag or "time" not in mag or "B" not in mag:
             return None
 
-        t_mag_full = ensure_datetime_array(mag["time"])
-        b_full = mag["B"]
-
         t0 = center - timedelta(hours=window_hours)
         t1 = center + timedelta(hours=window_hours)
 
+        # =====================================================================
+        # AVERAGE ALL DATA TO 5-MINUTE BINS
+        # =====================================================================
+        
+        print(f"\n[5MIN AVG] Averaging all data to 5-minute bins for {spacecraft_name} @ {center}")
+        
+        # --- Average MAG data ---
+        t_mag_full = ensure_datetime_array(mag["time"])
+        b_full = mag["B"]
         mask_mag = (t_mag_full >= t0) & (t_mag_full <= t1)
+        
         if not np.any(mask_mag):
             return None
-
-        t_mag = t_mag_full[mask_mag]
-        b = b_full[mask_mag]
-
+        
+        t_mag_1min = t_mag_full[mask_mag]
+        b_1min = b_full[mask_mag]
+        
+        # Decimate if still too many points (>200k)
         max_points = 200_000
-        if len(t_mag) > max_points:
-            step = int(np.ceil(len(t_mag) / float(max_points)))
-            t_mag = t_mag[::step]
-            b = b[::step]
+        if len(t_mag_1min) > max_points:
+            step = int(np.ceil(len(t_mag_1min) / float(max_points)))
+            t_mag_1min = t_mag_1min[::step]
+            b_1min = b_1min[::step]
+        
+        # Average to 5-minute bins
+        b_5min = Plotter.average_to_5min_bins(t_mag_1min, b_1min, is_vector=True)
+        t_mag = b_5min["time"]
+        b = b_5min["data"]
+        print(f"  MAG: {len(t_mag_1min)} → {len(t_mag)} points")
+        
+        # --- Average L1 shifted B-field ---
+        l1_b_5min = None
+        t_l1 = None
+        if l1_shifted and "B_gse_shifted" in l1_shifted:
+            t_l1_full = ensure_datetime_array(l1_shifted["time"])
+            b_l1_full = l1_shifted["B_gse_shifted"]
+            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+            if np.any(mask_l1):
+                t_l1_1min = t_l1_full[mask_l1]
+                b_l1_1min = b_l1_full[mask_l1]
+                l1_b_5min = Plotter.average_to_5min_bins(t_l1_1min, b_l1_1min, is_vector=True)
+                t_l1 = l1_b_5min["time"]
+                print(f"  L1 B: {len(t_l1_1min)} → {len(t_l1)} points")
+        
+        # --- Average L1 shifted velocity ---
+        l1_v_5min = None
+        if l1_shifted and "V_shifted" in l1_shifted:
+            t_l1_full = ensure_datetime_array(l1_shifted["time"])
+            v_l1_full = l1_shifted["V_shifted"]
+            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+            if np.any(mask_l1):
+                t_l1_1min = t_l1_full[mask_l1]
+                v_l1_1min = v_l1_full[mask_l1]
+                l1_v_5min = Plotter.average_to_5min_bins(t_l1_1min, v_l1_1min, is_vector=True)
+                print(f"  L1 V: {len(t_l1_1min)} → {len(l1_v_5min['time'])} points")
+        
+        # --- Average L1 shifted density ---
+        l1_n_5min = None
+        if l1_shifted and "n_shifted" in l1_shifted:
+            t_l1_full = ensure_datetime_array(l1_shifted["time"])
+            n_l1_full = l1_shifted["n_shifted"]
+            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+            if np.any(mask_l1):
+                t_l1_1min = t_l1_full[mask_l1]
+                n_l1_1min = n_l1_full[mask_l1]
+                l1_n_5min = Plotter.average_to_5min_bins(t_l1_1min, n_l1_1min, is_vector=False)
+                print(f"  L1 n: {len(t_l1_1min)} → {len(l1_n_5min['time'])} points")
+        
+        # --- Average L1 shifted temperature ---
+        l1_t_5min = None
+        if l1_shifted and "T_shifted" in l1_shifted:
+            t_l1_full = ensure_datetime_array(l1_shifted["time"])
+            t_l1_full_data = l1_shifted["T_shifted"]
+            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
+            if np.any(mask_l1):
+                t_l1_1min = t_l1_full[mask_l1]
+                t_l1_1min_data = t_l1_full_data[mask_l1]
+                l1_t_5min = Plotter.average_to_5min_bins(t_l1_1min, t_l1_1min_data, is_vector=False)
+                print(f"  L1 T: {len(t_l1_1min)} → {len(l1_t_5min['time'])} points")
+        
+        # --- Average SWA moments (n, V, T) ---
+        swa_n_5min = None
+        swa_v_5min = None
+        swa_t_5min = None
+        if swa_moments:
+            if "n" in swa_moments:
+                t_swa_full = ensure_datetime_array(swa_moments["time"])
+                n_swa_full = np.array(swa_moments["n"])
+                mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+                if np.any(mask_swa):
+                    t_swa_1min = t_swa_full[mask_swa]
+                    n_swa_1min = n_swa_full[mask_swa]
+                    swa_n_5min = Plotter.average_to_5min_bins(t_swa_1min, n_swa_1min, is_vector=False)
+                    print(f"  SWA n: {len(t_swa_1min)} → {len(swa_n_5min['time'])} points")
+            
+            if "V" in swa_moments:
+                t_swa_full = ensure_datetime_array(swa_moments["time"])
+                v_swa_full = np.array(swa_moments["V"])
+                mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+                if np.any(mask_swa):
+                    t_swa_1min = t_swa_full[mask_swa]
+                    v_swa_1min = v_swa_full[mask_swa]
+                    swa_v_5min = Plotter.average_to_5min_bins(t_swa_1min, v_swa_1min, is_vector=True)
+                    print(f"  SWA V: {len(t_swa_1min)} → {len(swa_v_5min['time'])} points")
+            
+            if "T" in swa_moments:
+                t_swa_full = ensure_datetime_array(swa_moments["time"])
+                t_swa_full_data = np.array(swa_moments["T"])
+                mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
+                if np.any(mask_swa):
+                    t_swa_1min = t_swa_full[mask_swa]
+                    t_swa_1min_data = t_swa_full_data[mask_swa]
+                    swa_t_5min = Plotter.average_to_5min_bins(t_swa_1min, t_swa_1min_data, is_vector=False)
+                    print(f"  SWA T: {len(t_swa_1min)} → {len(swa_t_5min['time'])} points")
+        
+        # --- Average eflux spectrogram ---
+        swa_eflux_5min = None
+        energy_bins = None
+        if swa and "eflux" in swa and swa.get("eflux") is not None:
+            t_ef_full = ensure_datetime_array(swa["time"])
+            mask_ef = (t_ef_full >= t0) & (t_ef_full <= t1)
+            if np.any(mask_ef):
+                t_ef_1min = t_ef_full[mask_ef]
+                eflux_1min = np.array(swa["eflux"])[mask_ef]
+                energy_bins = swa.get("energy")
+                
+                if eflux_1min.ndim == 2:
+                    swa_eflux_5min = Plotter.average_spectrogram_to_5min(t_ef_1min, eflux_1min)
+                    print(f"  Eflux: {len(t_ef_1min)} → {len(swa_eflux_5min['time'])} points")
+        
+        # --- Average Dst data ---
+        dst_shifted_5min = None
+        if dst_shifted:
+            dst_times = np.array(dst_shifted["time"])
+            dst_vals = np.array(dst_shifted["dst_shifted"])
+            dst_shifted_5min = Plotter.average_to_5min_bins(dst_times, dst_vals, is_vector=False)
+            print(f"  Dst shifted: {len(dst_times)} → {len(dst_shifted_5min['time'])} points")
+        
+        dst_pred_5min = None
+        if dst_pred:
+            dst_pred_times = np.array(dst_pred["time"])
+            dst_pred_vals = np.array(dst_pred["dst_predicted"])
+            dst_pred_5min = Plotter.average_to_5min_bins(dst_pred_times, dst_pred_vals, is_vector=False)
+            print(f"  Dst predicted: {len(dst_pred_times)} → {len(dst_pred_5min['time'])} points")
+        
+        # --- Average Kp data ---
+        kp_shifted_5min = None
+        if kp_shifted:
+            kp_times = np.array(kp_shifted["time"])
+            kp_vals = np.array(kp_shifted["kp_shifted"])
+            kp_shifted_5min = Plotter.average_to_5min_bins(kp_times, kp_vals, is_vector=False)
+            print(f"  Kp shifted: {len(kp_times)} → {len(kp_shifted_5min['time'])} points")
+        
+        kp_pred_5min = None
+        if kp_pred:
+            kp_pred_times = np.array(kp_pred["time"])
+            kp_pred_vals = np.array(kp_pred["kp_predicted"])
+            kp_pred_5min = Plotter.average_to_5min_bins(kp_pred_times, kp_pred_vals, is_vector=False)
+            print(f"  Kp predicted: {len(kp_pred_times)} → {len(kp_pred_5min['time'])} points")
+        
+        # --- Average spacecraft position data (distance and angle) ---
+        sc_times = spacecraft_ephemeris["times"]
+        sc_positions = spacecraft_ephemeris["positions"]
+        mask_sc = [(t0 <= t <= t1) for t in sc_times]
+        
+        distances_5min = None
+        angles_5min = None
+        t_sc_5min = None
+        
+        if np.any(mask_sc):
+            t_sc = np.array(sc_times)[mask_sc]
+            pos_sc = sc_positions[mask_sc]
+            
+            earth_positions = np.array([SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) for t in t_sc])
+            distances = np.linalg.norm(pos_sc - earth_positions, axis=1) / AU_KM
+            
+            angles = []
+            for i in range(len(t_sc)):
+                earth_vec = earth_positions[i]
+                sc_vec = pos_sc[i]
+                earth_hat = earth_vec / np.linalg.norm(earth_vec)
+                sc_hat = sc_vec / np.linalg.norm(sc_vec)
+                cos_angle = np.clip(np.dot(earth_hat, sc_hat), -1.0, 1.0)
+                angle_deg = np.degrees(np.arccos(cos_angle))
+                angles.append(angle_deg)
+            angles = np.array(angles)
+            
+            distances_5min = Plotter.average_to_5min_bins(t_sc, distances, is_vector=False)
+            angles_5min = Plotter.average_to_5min_bins(t_sc, angles, is_vector=False)
+            t_sc_5min = distances_5min["time"]
+            print(f"  Distance/Angle: {len(t_sc)} → {len(t_sc_5min)} points")
+
+        print(f"[5MIN AVG] Averaging complete\n")
+
+        # =====================================================================
+        # NOW PLOT USING 5-MINUTE AVERAGED DATA
+        # =====================================================================
 
         from matplotlib.gridspec import GridSpec
         from matplotlib.dates import DateFormatter, AutoDateLocator
@@ -3254,14 +3535,11 @@ class Plotter:
         b_mag = np.linalg.norm(b, axis=1)
         ax_insitu[0].plot(t_mag, b_mag, linewidth=1.2, color='black', label=f"{spacecraft_name} |B|")
         
-        if l1_shifted and "B_gse_shifted" in l1_shifted:
-            b_l1 = l1_shifted["B_gse_shifted"]
-            t_l1_full = ensure_datetime_array(l1_shifted["time"])
-            mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-            if np.any(mask_l1):
-                t_l1 = t_l1_full[mask_l1]
-                b_l1_mag = np.linalg.norm(b_l1[mask_l1], axis=1)
-                ax_insitu[0].plot(t_l1, b_l1_mag, linewidth=1.0, color='gray', linestyle=':', alpha=0.7, label="L1 |B| (shifted)")
+        if l1_b_5min is not None:
+            b_l1_5min = l1_b_5min["data"]
+            t_l1_5min = l1_b_5min["time"]
+            b_l1_mag = np.linalg.norm(b_l1_5min, axis=1)
+            ax_insitu[0].plot(t_l1_5min, b_l1_mag, linewidth=1.0, color='gray', linestyle=':', alpha=0.7, label="L1 |B| (shifted)")
         
         ax_insitu[0].set_ylabel("|B| [nT]", fontsize=11, fontweight='bold')
         ax_insitu[0].grid(True, alpha=0.3)
@@ -3269,20 +3547,17 @@ class Plotter:
         ax_insitu[0].set_ylim(bottom=0)
 
         # Panels 1-3: Br, Bt, Bn
-        b_labels = ["Br", "Bt", "Bn"]
+        b_labels = ["r", "t", "n"]
         b_colors = ["red", "green", "blue"]
 
         for i in range(min(3, b.shape[1])):
             ax_insitu[i+1].plot(t_mag, b[:, i], linewidth=1.2, color=b_colors[i], label=f"{spacecraft_name} B{b_labels[i]}")
             
-            if l1_shifted and "B_gse_shifted" in l1_shifted:
-                b_l1 = l1_shifted["B_gse_shifted"]
-                t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                if np.any(mask_l1) and b_l1.shape[1] > i:
-                    t_l1 = t_l1_full[mask_l1]
-                    b_l1_i = b_l1[mask_l1, i]
-                    ax_insitu[i+1].plot(t_l1, b_l1_i, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label=f"L1 B{b_labels[i]} (shifted)")
+            if l1_b_5min is not None and l1_b_5min["data"].shape[1] > i:
+                b_l1_5min = l1_b_5min["data"]
+                t_l1_5min = l1_b_5min["time"]
+                b_l1_i = b_l1_5min[:, i]
+                ax_insitu[i+1].plot(t_l1_5min, b_l1_i, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label=f"L1 B{b_labels[i]} (shifted)")
             
             ax_insitu[i+1].set_ylabel(f"B{b_labels[i]} [nT]", fontsize=11, fontweight='bold')
             ax_insitu[i+1].grid(True, alpha=0.3)
@@ -3290,81 +3565,57 @@ class Plotter:
             ax_insitu[i+1].axhline(0, color="black", linestyle=":", alpha=0.5, linewidth=0.8)
 
         # Panel 4: Density (n)
-        if swa_moments and "n" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                n_data = np.array(swa_moments["n"])[mask_swa]
-                ax_insitu[4].plot(t_swa, n_data, linewidth=1.2, color="orange", label=f"{spacecraft_name} n")
-                
-                if l1_shifted and "n_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        n_l1_data = np.array(l1_shifted["n_shifted"])[mask_l1]
-                        ax_insitu[4].plot(t_l1, n_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 n (shifted)")
-                
-                ax_insitu[4].set_ylabel("n [cm⁻³]", fontsize=11, fontweight='bold')
-                ax_insitu[4].legend(loc="upper right", fontsize=8)
-                ax_insitu[4].set_ylim(bottom=0)
-            else:
-                ax_insitu[4].text(0.5, 0.5, "No n in window", ha="center", va="center", transform=ax_insitu[4].transAxes, fontsize=10)
+        if swa_n_5min is not None:
+            t_swa_5min = swa_n_5min["time"]
+            n_data_5min = swa_n_5min["data"]
+            ax_insitu[4].plot(t_swa_5min, n_data_5min, linewidth=1.2, color="orange", label=f"{spacecraft_name} n")
+            
+            if l1_n_5min is not None:
+                t_l1_n_5min = l1_n_5min["time"]
+                n_l1_data_5min = l1_n_5min["data"]
+                ax_insitu[4].plot(t_l1_n_5min, n_l1_data_5min, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 n (shifted)")
+            
+            ax_insitu[4].set_ylabel("n [cm⁻³]", fontsize=11, fontweight='bold')
+            ax_insitu[4].legend(loc="upper right", fontsize=8)
+            ax_insitu[4].set_ylim(bottom=0)
         else:
             ax_insitu[4].text(0.5, 0.5, "No n", ha="center", va="center", transform=ax_insitu[4].transAxes, fontsize=10)
         ax_insitu[4].grid(True, alpha=0.3)
 
         # Panel 5: Velocity (V)
-        if swa_moments and "V" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                v_data = np.array(swa_moments["V"])[mask_swa]
-                v_mag = np.linalg.norm(v_data, axis=1)
-                ax_insitu[5].plot(t_swa, v_mag, linewidth=1.2, color="cyan", label=f"{spacecraft_name} V")
-                
-                if l1_shifted and "V_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        v_l1 = np.array(l1_shifted["V_shifted"])[mask_l1]
-                        v_l1_mag = np.linalg.norm(v_l1, axis=1)
-                        ax_insitu[5].plot(t_l1, v_l1_mag, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 V (shifted)")
-                
-                ax_insitu[5].set_ylabel("V [km/s]", fontsize=11, fontweight='bold')
-                ax_insitu[5].legend(loc="upper right", fontsize=8)
-                ax_insitu[5].set_ylim(bottom=0)
-            else:
-                ax_insitu[5].text(0.5, 0.5, "No V in window", ha="center", va="center", transform=ax_insitu[5].transAxes, fontsize=10)
+        if swa_v_5min is not None:
+            t_swa_v_5min = swa_v_5min["time"]
+            v_data_5min = swa_v_5min["data"]
+            v_mag_5min = np.linalg.norm(v_data_5min, axis=1)
+            ax_insitu[5].plot(t_swa_v_5min, v_mag_5min, linewidth=1.2, color="cyan", label=f"{spacecraft_name} V")
+            
+            if l1_v_5min is not None:
+                t_l1_v_5min = l1_v_5min["time"]
+                v_l1_5min = l1_v_5min["data"]
+                v_l1_mag_5min = np.linalg.norm(v_l1_5min, axis=1)
+                ax_insitu[5].plot(t_l1_v_5min, v_l1_mag_5min, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 V (shifted)")
+            
+            ax_insitu[5].set_ylabel("V [km/s]", fontsize=11, fontweight='bold')
+            ax_insitu[5].legend(loc="upper right", fontsize=8)
+            ax_insitu[5].set_ylim(bottom=0)
         else:
             ax_insitu[5].text(0.5, 0.5, "No V", ha="center", va="center", transform=ax_insitu[5].transAxes, fontsize=10)
         ax_insitu[5].grid(True, alpha=0.3)
 
         # Panel 6: Temperature (T)
-        if swa_moments and "T" in swa_moments:
-            t_swa_full = ensure_datetime_array(swa_moments["time"])
-            mask_swa = (t_swa_full >= t0) & (t_swa_full <= t1)
-            if np.any(mask_swa):
-                t_swa = t_swa_full[mask_swa]
-                t_data = np.array(swa_moments["T"])[mask_swa]
-                ax_insitu[6].plot(t_swa, t_data, linewidth=1.2, color="purple", label=f"{spacecraft_name} T")
-                
-                if l1_shifted and "T_shifted" in l1_shifted:
-                    t_l1_full = ensure_datetime_array(l1_shifted["time"])
-                    mask_l1 = (t_l1_full >= t0) & (t_l1_full <= t1)
-                    if np.any(mask_l1):
-                        t_l1 = t_l1_full[mask_l1]
-                        t_l1_data = np.array(l1_shifted["T_shifted"])[mask_l1]
-                        ax_insitu[6].plot(t_l1, t_l1_data, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 T (shifted)")
-                
-                ax_insitu[6].set_ylabel("T [eV]", fontsize=11, fontweight='bold')
-                ax_insitu[6].legend(loc="upper right", fontsize=8)
-                ax_insitu[6].set_ylim(bottom=0)
-            else:
-                ax_insitu[6].text(0.5, 0.5, "No T in window", ha="center", va="center", transform=ax_insitu[6].transAxes, fontsize=10)
+        if swa_t_5min is not None:
+            t_swa_t_5min = swa_t_5min["time"]
+            t_data_5min = swa_t_5min["data"]
+            ax_insitu[6].plot(t_swa_t_5min, t_data_5min, linewidth=1.2, color="purple", label=f"{spacecraft_name} T")
+            
+            if l1_t_5min is not None:
+                t_l1_t_5min = l1_t_5min["time"]
+                t_l1_data_5min = l1_t_5min["data"]
+                ax_insitu[6].plot(t_l1_t_5min, t_l1_data_5min, linewidth=1.0, color='black', linestyle=':', alpha=0.7, label="L1 T (shifted)")
+            
+            ax_insitu[6].set_ylabel("T [eV]", fontsize=11, fontweight='bold')
+            ax_insitu[6].legend(loc="upper right", fontsize=8)
+            ax_insitu[6].set_ylim(bottom=0)
         else:
             ax_insitu[6].text(0.5, 0.5, "No T", ha="center", va="center", transform=ax_insitu[6].transAxes, fontsize=10)
         ax_insitu[6].grid(True, alpha=0.3)
@@ -3384,6 +3635,7 @@ class Plotter:
 
         plt.suptitle(f"{spacecraft_name} In-Situ Measurements — {center.strftime('%Y-%m-%d %H:%M:%S')}", fontsize=14, y=0.995)
         fig1.autofmt_xdate()
+        plt.tight_layout()
 
         # =====================================================================
         # FIGURE 2: CONTEXT DATA (Eflux, Dst, Kp, Distance&Angle)
@@ -3404,37 +3656,29 @@ class Plotter:
                 Plotter._add_icme_shading(ax_context, icmes_mvab, t0, t1, base_color='blue', label_suffix=' (MVAB)')
 
         # Panel 0: Eflux
-        if swa and "eflux" in swa and swa.get("eflux") is not None:
+        if swa_eflux_5min is not None and energy_bins is not None:
             from matplotlib.dates import date2num
             import matplotlib.colors as mcolors
 
-            t_ef_full = ensure_datetime_array(swa["time"])
-            mask_ef = (t_ef_full >= t0) & (t_ef_full <= t1)
+            t_ef_5min = swa_eflux_5min["time"]
+            eflux_5min = swa_eflux_5min["eflux"]
 
-            if np.any(mask_ef):
-                t_ef = t_ef_full[mask_ef]
-                eflux = np.array(swa["eflux"])[mask_ef]
-                energy = swa.get("energy")
+            if eflux_5min.ndim == 2:
+                times_mpl = date2num(t_ef_5min)
+                t_mesh, e_mesh = np.meshgrid(times_mpl, energy_bins)
 
-                if eflux.ndim == 2 and energy is not None:
-                    times_mpl = date2num(t_ef)
-                    t_mesh, e_mesh = np.meshgrid(times_mpl, energy)
+                pcm = ax_context[0].pcolormesh(t_mesh, e_mesh, eflux_5min.T, shading="auto", cmap="jet", 
+                                               norm=mcolors.LogNorm(vmin=1e5, vmax=1e10))
+                ax_context[0].set_yscale("log")
+                ax_context[0].set_ylabel("Energy [eV]", fontsize=11, fontweight='bold')
+                ax_context[0].set_ylim([100, 2e4])
 
-                    pcm = ax_context[0].pcolormesh(t_mesh, e_mesh, eflux.T, shading="auto", cmap="jet", 
-                                                   norm=mcolors.LogNorm(vmin=1e5, vmax=1e10))
-                    ax_context[0].set_yscale("log")
-                    ax_context[0].set_ylabel("Energy [eV]", fontsize=11, fontweight='bold')
-                    ax_context[0].set_ylim([100, 2e4])
-
-                    pos = ax_context[0].get_position()
-                    cax = fig2.add_axes([pos.x1 + 0.01, pos.y0, 0.015, pos.height])
-                    cbar = fig2.colorbar(pcm, cax=cax)
-                    cbar.set_label(r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]", rotation=270, labelpad=20, fontsize=9)
-                else:
-                    ax_context[0].text(0.5, 0.5, "No 2D eflux", ha="center", va="center", 
-                                      transform=ax_context[0].transAxes, fontsize=10)
+                pos = ax_context[0].get_position()
+                cax = fig2.add_axes([pos.x1 + 0.01, pos.y0, 0.015, pos.height])
+                cbar = fig2.colorbar(pcm, cax=cax)
+                cbar.set_label(r"eflux [cm$^{-2}$ s$^{-1}$ sr$^{-1}$ eV$^{-1}$]", rotation=270, labelpad=20, fontsize=9)
             else:
-                ax_context[0].text(0.5, 0.5, "No Eflux in window", ha="center", va="center", 
+                ax_context[0].text(0.5, 0.5, "No 2D eflux", ha="center", va="center", 
                                   transform=ax_context[0].transAxes, fontsize=10)
         else:
             ax_context[0].text(0.5, 0.5, "No Eflux", ha="center", va="center", 
@@ -3443,12 +3687,12 @@ class Plotter:
 
         # Panel 1: Dst
         has_dst = False
-        if dst_shifted:
-            ax_context[1].plot(dst_shifted["time"], dst_shifted["dst_shifted"], linewidth=1.5, 
+        if dst_shifted_5min is not None:
+            ax_context[1].plot(dst_shifted_5min["time"], dst_shifted_5min["data"], linewidth=1.5, 
                              color="blue", label="Measured Dst (Time-Shifted)", alpha=0.8)
             has_dst = True
-        if dst_pred:
-            ax_context[1].plot(dst_pred["time"], dst_pred["dst_predicted"], linewidth=1.5, 
+        if dst_pred_5min is not None:
+            ax_context[1].plot(dst_pred_5min["time"], dst_pred_5min["data"], linewidth=1.5, 
                              color="red", linestyle="--", label="Predicted Dst (Crossover)", alpha=0.8)
             has_dst = True
 
@@ -3465,12 +3709,12 @@ class Plotter:
 
         # Panel 2: Kp
         has_kp = False
-        if kp_shifted:
-            ax_context[2].plot(kp_shifted["time"], kp_shifted["kp_shifted"], linewidth=1.5, 
+        if kp_shifted_5min is not None:
+            ax_context[2].plot(kp_shifted_5min["time"], kp_shifted_5min["data"], linewidth=1.5, 
                              color="blue", label="Measured Kp (Time-Shifted)", alpha=0.8)
             has_kp = True
-        if kp_pred:
-            ax_context[2].plot(kp_pred["time"], kp_pred["kp_predicted"], linewidth=1.5, 
+        if kp_pred_5min is not None:
+            ax_context[2].plot(kp_pred_5min["time"], kp_pred_5min["data"], linewidth=1.5, 
                              color="red", linestyle="--", label="Predicted Kp (Crossover)", alpha=0.8)
             has_kp = True
 
@@ -3486,37 +3730,19 @@ class Plotter:
         ax_context[2].grid(True, alpha=0.3)
 
         # Panel 3: Position (Distance + Angle)
-        sc_times = spacecraft_ephemeris["times"]
-        sc_positions = spacecraft_ephemeris["positions"]
-        
-        mask_sc = [(t0 <= t <= t1) for t in sc_times]
-        if np.any(mask_sc):
-            t_sc = np.array(sc_times)[mask_sc]
-            pos_sc = sc_positions[mask_sc]
+        if distances_5min is not None and angles_5min is not None:
+            t_sc_5min = distances_5min["time"]
+            dist_5min = distances_5min["data"]
+            ang_5min = angles_5min["data"]
             
-            earth_positions = np.array([SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) for t in t_sc])
-            distances = np.linalg.norm(pos_sc - earth_positions, axis=1) / AU_KM
-            
-            angles = []
-            for i in range(len(t_sc)):
-                earth_vec = earth_positions[i]
-                sc_vec = pos_sc[i]
-                earth_hat = earth_vec / np.linalg.norm(earth_vec)
-                sc_hat = sc_vec / np.linalg.norm(sc_vec)
-                cos_angle = np.clip(np.dot(earth_hat, sc_hat), -1.0, 1.0)
-                angle_deg = np.degrees(np.arccos(cos_angle))
-                angles.append(angle_deg)
-            
-            angles = np.array(angles)
-            
-            ax_context[3].plot(t_sc, distances, 'k-', linewidth=1.5, label='Distance to Earth')
+            ax_context[3].plot(t_sc_5min, dist_5min, 'k-', linewidth=1.5, label='Distance to Earth')
             ax_context[3].set_ylabel('Distance [AU]', color='k', fontsize=11, fontweight='bold')
             ax_context[3].tick_params(axis='y', labelcolor='k')
             ax_context[3].grid(True, alpha=0.3)
             ax_context[3].set_ylim(bottom=0)
             
             ax_angle = ax_context[3].twinx()
-            ax_angle.plot(t_sc, angles, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
+            ax_angle.plot(t_sc_5min, ang_5min, 'r-', linewidth=1.5, label='Angle from Sun-Earth line')
             ax_angle.set_ylabel('Angle [deg]', color='r', fontsize=11, fontweight='bold')
             ax_angle.tick_params(axis='y', labelcolor='r')
             ax_angle.set_ylim([0, 180])
@@ -3560,6 +3786,7 @@ class Plotter:
             plt.close(fig2)
 
         return fig1, fig2
+    
 # ------------------------------ Main driver ----------------------------- #
 
 def main():
