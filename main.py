@@ -28,7 +28,59 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
+
+# ---------------------------- Constants & Toggles --------------------------- #
+
+AU_KM = 1.496e8
+YEAR_DAYS = 365.25
+MEAN_MOTION = 2 * np.pi / YEAR_DAYS
+EARTH_EPHEMERIS_MARGIN_DAYS = 60 
+ECCENTRICITY = 0.10
+
+START_DATE = datetime(2007, 6, 1) 
+END_DATE = datetime(2025, 12, 31) 
+
+SUN_EARTH_TOL_AU= 0.18
+DRO_TOL_AU = 0.35
+
+DT_HOURS = 6
+INSITU_WINDOW_HR = 144  # ± 5 days
+FILTER_SUNWARD_ONLY = True  
+MAG_TARGET_POINTS_PER_DAY = 1440
+
+PLOT_ONLY_ICME_EVENTS = True 
+
+PLOT_OVERVIEW = True
+PLOT_HELIOCENTRIC = True
+PLOT_EARTH_FRAME = True
+PLOT_INSITU_DST = True
+
+SAVE_PLOTS_TO_FILE = True 
+SAVE_DATA_CSV = True
+
+FIGURES_ROOT = '/Users/henryhodges/Documents/Year 4/Masters/Code/figures'
+
+PROPAGATION_METHOD = "both"  # "flat", "mvab", "both"
+MVAB_WINDOW_MINUTES = 30     # Time window for MVAB analysis
+MVAB_QUALITY_MIN = 3.0       # Minimum eigenvalue ratio (λ_max/λ_min)
+
+EVENT_LIMIT = {
+    "STEREO-A": None,
+    "Solar Orbiter": None,
+    "Parker Solar Probe": None,
+    "STEREO-B": None,
+}
+
+WRITE_EVENTS_CSV = True
+CSV_FILENAME = "henon_dro_crossover_events.csv"
+TRACK_CONTEXT_DAYS = 42
+
+
 # ---------------------------- Utilities --------------------------- #
+
+
+class TimeoutError(Exception):
+    pass
 
 def setup_output_folder():
     if not SAVE_PLOTS_TO_FILE:
@@ -62,15 +114,22 @@ def setup_output_folder():
         else:
             break
     
-    # Create the folder
+    # Create the main folder
     os.makedirs(full_path, exist_ok=True)
     print(f"\n✓ Created output folder: {full_path}")
+    
+    # Create subdirectories if CSV saving is enabled
+    if SAVE_DATA_CSV:
+        plots_path = os.path.join(full_path, "plots")
+        csv_path = os.path.join(full_path, "csv")
+        os.makedirs(plots_path, exist_ok=True)
+        os.makedirs(csv_path, exist_ok=True)
+        print(f"✓ Created plots subfolder: {plots_path}")
+        print(f"✓ Created csv subfolder: {csv_path}")
+    
     print("="*80 + "\n")
     
     return full_path
-
-class TimeoutError(Exception):
-    pass
 
 def timeout_handler(signum, frame):
     raise TimeoutError("CDF read timed out")
@@ -116,6 +175,254 @@ def ensure_datetime_array(times):
                 out.append(datetime(1970, 1, 1))
     return np.array(out, dtype=object)
 
+def write_event_csv(event, preloaded_data, spacecraft_ephemeris, epoch_date, 
+                   spacecraft_name, output_folder, window_hours=INSITU_WINDOW_HR):
+    """
+    Write event data to CSV file.
+    
+    Args:
+        event: Crossover event dictionary
+        preloaded_data: Dictionary containing all preloaded data for this spacecraft
+        spacecraft_ephemeris: Spacecraft ephemeris data
+        epoch_date: Epoch datetime (START_DATE)
+        spacecraft_name: Name of spacecraft
+        output_folder: Base output folder
+        window_hours: Time window in hours
+    """
+    if not SAVE_DATA_CSV or not output_folder:
+        return
+    
+    center = event.get("time")
+    if not isinstance(center, datetime):
+        return
+    
+    d = preloaded_data.get(center)
+    if not d:
+        return
+    
+    # Extract data
+    mag = d.get("mag")
+    swa_moments = d.get("swa_moments")
+    dst_shifted = d.get("dst_shifted")
+    kp_shifted = d.get("kp_shifted")
+    l1_shifted = d.get("l1_shifted")
+    
+    if not mag or "time" not in mag or "B" not in mag:
+        return
+    
+    t0 = center - timedelta(hours=window_hours)
+    t1 = center + timedelta(hours=window_hours)
+    
+    # Get MAG data
+    t_mag = ensure_datetime_array(mag["time"])
+    b_mag = mag["B"]
+    mask_mag = (t_mag >= t0) & (t_mag <= t1)
+    
+    if not np.any(mask_mag):
+        return
+    
+    t_mag = t_mag[mask_mag]
+    b_mag = b_mag[mask_mag]
+    
+    # Build CSV data dictionary
+    csv_data = {
+        'timestamp': [t.strftime('%Y-%m-%d %H:%M:%S.%f') for t in t_mag],
+        'unix_timestamp': [t.timestamp() for t in t_mag],
+        'spacecraft': [spacecraft_name] * len(t_mag),
+        'crossover_date': [center.strftime('%Y-%m-%d')] * len(t_mag),
+        'crossover_time': [center.strftime('%H:%M:%S')] * len(t_mag),
+    }
+    
+    # Spacecraft magnetic field (RTN)
+    csv_data['B_r'] = b_mag[:, 0] if b_mag.ndim > 1 else np.full(len(t_mag), np.nan)
+    csv_data['B_t'] = b_mag[:, 1] if b_mag.ndim > 1 else np.full(len(t_mag), np.nan)
+    csv_data['B_n'] = b_mag[:, 2] if b_mag.ndim > 1 else np.full(len(t_mag), np.nan)
+    csv_data['B_mag'] = np.linalg.norm(b_mag, axis=1) if b_mag.ndim > 1 else np.abs(b_mag)
+    
+    # Spacecraft plasma (SWA moments) - interpolate to MAG times
+    mag_times_sec = np.array([t.timestamp() for t in t_mag])
+    
+    if swa_moments and "time" in swa_moments:
+        swa_times = ensure_datetime_array(swa_moments["time"])
+        swa_times_sec = np.array([t.timestamp() for t in swa_times])
+        
+        # Density
+        if "n" in swa_moments:
+            n_swa = np.array(swa_moments["n"], dtype=float)
+            f_n = interp1d(swa_times_sec, n_swa, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['swa_n'] = f_n(mag_times_sec)
+        else:
+            csv_data['swa_n'] = np.full(len(t_mag), np.nan)
+        
+        # Velocity
+        if "V" in swa_moments:
+            v_swa = np.array(swa_moments["V"], dtype=float)
+            if v_swa.ndim > 1 and v_swa.shape[1] == 3:
+                for i, comp in enumerate(['swa_V_r', 'swa_V_t', 'swa_V_n']):
+                    f_v = interp1d(swa_times_sec, v_swa[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+                    csv_data[comp] = f_v(mag_times_sec)
+                csv_data['swa_V_mag'] = np.sqrt(csv_data['swa_V_r']**2 + csv_data['swa_V_t']**2 + csv_data['swa_V_n']**2)
+            else:
+                for comp in ['swa_V_r', 'swa_V_t', 'swa_V_n', 'swa_V_mag']:
+                    csv_data[comp] = np.full(len(t_mag), np.nan)
+        else:
+            for comp in ['swa_V_r', 'swa_V_t', 'swa_V_n', 'swa_V_mag']:
+                csv_data[comp] = np.full(len(t_mag), np.nan)
+        
+        # Temperature
+        if "T" in swa_moments:
+            t_swa = np.array(swa_moments["T"], dtype=float)
+            f_t = interp1d(swa_times_sec, t_swa, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['swa_T'] = f_t(mag_times_sec)
+        else:
+            csv_data['swa_T'] = np.full(len(t_mag), np.nan)
+    else:
+        for col in ['swa_n', 'swa_V_r', 'swa_V_t', 'swa_V_n', 'swa_V_mag', 'swa_T']:
+            csv_data[col] = np.full(len(t_mag), np.nan)
+    
+    # L1 data (ballistic propagation) - interpolate to MAG times
+    if l1_shifted and "B_gse_shifted" in l1_shifted:
+        l1_times = ensure_datetime_array(l1_shifted["time"])
+        l1_times_sec = np.array([t.timestamp() for t in l1_times])
+        
+        # Magnetic field
+        b_l1 = l1_shifted["B_gse_shifted"]
+        if b_l1.ndim > 1 and b_l1.shape[1] == 3:
+            for i, comp in enumerate(['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse']):
+                f_b = interp1d(l1_times_sec, b_l1[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+                csv_data[comp] = f_b(mag_times_sec)
+            csv_data['l1_B_mag'] = np.sqrt(csv_data['l1_B_x_gse']**2 + csv_data['l1_B_y_gse']**2 + csv_data['l1_B_z_gse']**2)
+        else:
+            for comp in ['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse', 'l1_B_mag']:
+                csv_data[comp] = np.full(len(t_mag), np.nan)
+        
+        # Velocity
+        if "V_shifted" in l1_shifted:
+            v_l1 = l1_shifted["V_shifted"]
+            if v_l1.ndim > 1 and v_l1.shape[1] == 3:
+                for i, comp in enumerate(['l1_V_x', 'l1_V_y', 'l1_V_z']):
+                    f_v = interp1d(l1_times_sec, v_l1[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+                    csv_data[comp] = f_v(mag_times_sec)
+                csv_data['l1_V_mag'] = np.sqrt(csv_data['l1_V_x']**2 + csv_data['l1_V_y']**2 + csv_data['l1_V_z']**2)
+            else:
+                for comp in ['l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag']:
+                    csv_data[comp] = np.full(len(t_mag), np.nan)
+        else:
+            for comp in ['l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag']:
+                csv_data[comp] = np.full(len(t_mag), np.nan)
+        
+        # Density
+        if "n_shifted" in l1_shifted:
+            n_l1 = l1_shifted["n_shifted"]
+            f_n = interp1d(l1_times_sec, n_l1, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_n'] = f_n(mag_times_sec)
+        else:
+            csv_data['l1_n'] = np.full(len(t_mag), np.nan)
+        
+        # Temperature
+        if "T_shifted" in l1_shifted:
+            t_l1 = l1_shifted["T_shifted"]
+            f_t = interp1d(l1_times_sec, t_l1, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_T'] = f_t(mag_times_sec)
+        else:
+            csv_data['l1_T'] = np.full(len(t_mag), np.nan)
+        
+        # Propagation delay and distance
+        if "propagation_delay_hours" in l1_shifted:
+            delay = l1_shifted["propagation_delay_hours"]
+            f_delay = interp1d(l1_times_sec, delay, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_propagation_delay_hours'] = f_delay(mag_times_sec)
+        else:
+            csv_data['l1_propagation_delay_hours'] = np.full(len(t_mag), np.nan)
+        
+        if "propagation_distance_au" in l1_shifted:
+            dist = l1_shifted["propagation_distance_au"]
+            f_dist = interp1d(l1_times_sec, dist, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_propagation_distance_au'] = f_dist(mag_times_sec)
+        else:
+            csv_data['l1_propagation_distance_au'] = np.full(len(t_mag), np.nan)
+    else:
+        for col in ['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse', 'l1_B_mag',
+                    'l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag',
+                    'l1_n', 'l1_T', 'l1_propagation_delay_hours', 'l1_propagation_distance_au']:
+            csv_data[col] = np.full(len(t_mag), np.nan)
+    
+    # Geomagnetic indices (ballistic shifted)
+    if dst_shifted and "dst_shifted" in dst_shifted:
+        dst_times = ensure_datetime_array(dst_shifted["time"])
+        dst_times_sec = np.array([t.timestamp() for t in dst_times])
+        dst_vals = np.array(dst_shifted["dst_shifted"], dtype=float)
+        f_dst = interp1d(dst_times_sec, dst_vals, kind='linear', bounds_error=False, fill_value=np.nan)
+        csv_data['dst_shifted'] = f_dst(mag_times_sec)
+    else:
+        csv_data['dst_shifted'] = np.full(len(t_mag), np.nan)
+    
+    if kp_shifted and "kp_shifted" in kp_shifted:
+        kp_times = ensure_datetime_array(kp_shifted["time"])
+        kp_times_sec = np.array([t.timestamp() for t in kp_times])
+        kp_vals = np.array(kp_shifted["kp_shifted"], dtype=float)
+        f_kp = interp1d(kp_times_sec, kp_vals, kind='linear', bounds_error=False, fill_value=np.nan)
+        csv_data['kp_shifted'] = f_kp(mag_times_sec)
+    else:
+        csv_data['kp_shifted'] = np.full(len(t_mag), np.nan)
+    
+    # Spacecraft ephemeris - interpolate to MAG times
+    sc_times = spacecraft_ephemeris["times"]
+    sc_positions = spacecraft_ephemeris["positions"]
+    sc_times_sec = np.array([t.timestamp() for t in sc_times])
+    
+    for i, coord in enumerate(['sc_x_hci', 'sc_y_hci', 'sc_z_hci']):
+        f_pos = interp1d(sc_times_sec, sc_positions[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+        csv_data[coord] = f_pos(mag_times_sec)
+    
+    # Convert to AU
+    csv_data['sc_x_au'] = csv_data['sc_x_hci'] / AU_KM
+    csv_data['sc_y_au'] = csv_data['sc_y_hci'] / AU_KM
+    csv_data['sc_z_au'] = csv_data['sc_z_hci'] / AU_KM
+    
+    # Distance to Earth and angle
+    earth_positions = np.array([SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date) for t in t_mag])
+    sc_pos_array = np.column_stack([csv_data['sc_x_hci'], csv_data['sc_y_hci'], csv_data['sc_z_hci']])
+    
+    distances = np.linalg.norm(sc_pos_array - earth_positions, axis=1) / AU_KM
+    csv_data['sc_distance_to_earth_au'] = distances
+    
+    angles = []
+    for i in range(len(t_mag)):
+        earth_hat = earth_positions[i] / np.linalg.norm(earth_positions[i])
+        sc_hat = sc_pos_array[i] / np.linalg.norm(sc_pos_array[i])
+        cos_angle = np.clip(np.dot(earth_hat, sc_hat), -1.0, 1.0)
+        angles.append(np.degrees(np.arccos(cos_angle)))
+    csv_data['sc_angle_from_sun_earth_line_deg'] = np.array(angles)
+    
+    # Earth position
+    csv_data['earth_x_hci'] = earth_positions[:, 0]
+    csv_data['earth_y_hci'] = earth_positions[:, 1]
+    csv_data['earth_z_hci'] = earth_positions[:, 2]
+    csv_data['earth_x_au'] = earth_positions[:, 0] / AU_KM
+    csv_data['earth_y_au'] = earth_positions[:, 1] / AU_KM
+    csv_data['earth_z_au'] = earth_positions[:, 2] / AU_KM
+    
+    # Data quality flags
+    csv_data['mag_data_available'] = 1
+    csv_data['swa_data_available'] = 1 if (swa_moments and "n" in swa_moments) else 0
+    csv_data['l1_data_available'] = 1 if (l1_shifted and "B_gse_shifted" in l1_shifted) else 0
+    csv_data['dst_data_available'] = 1 if (dst_shifted and "dst_shifted" in dst_shifted) else 0
+    csv_data['kp_data_available'] = 1 if (kp_shifted and "kp_shifted" in kp_shifted) else 0
+    
+    # Create DataFrame and save
+    df = pd.DataFrame(csv_data)
+    
+    # Save to csv subfolder
+    csv_folder = os.path.join(output_folder, "csv")
+    safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
+    timestamp = center.strftime('%Y%m%d')
+    csv_filename = f"event_{safe_sc_name}_{timestamp}.csv"
+    csv_path = os.path.join(csv_folder, csv_filename)
+    
+    df.to_csv(csv_path, index=False, float_format='%.6f')
+    print(f"  💾 Saved CSV: {csv_path} ({len(df)} rows)")
+    
 def _dbg_stats(name, arr, units="", expected_min=None, expected_max=None):
     arr = np.asarray(arr, dtype=float).ravel()
     finite = arr[np.isfinite(arr)]
@@ -157,50 +464,6 @@ plt.rcParams.update({
     "grid.alpha": 0.25,
 })
 
-# ---------------------------- Constants & Toggles --------------------------- #
-
-AU_KM = 1.496e8
-YEAR_DAYS = 365.25
-MEAN_MOTION = 2 * np.pi / YEAR_DAYS
-EARTH_EPHEMERIS_MARGIN_DAYS = 60 
-
-START_DATE = datetime(2007, 1, 1)
-END_DATE = datetime(2024, 12, 31)
-
-ECCENTRICITY = 0.10
-SUN_EARTH_TOL_AU= 0.18
-DRO_TOL_AU = 0.4
-
-DT_HOURS = 6
-INSITU_WINDOW_HR = 144  # ± 5 days
-FILTER_SUNWARD_ONLY = True  
-MAG_TARGET_POINTS_PER_DAY = 1440
-
-PLOT_ONLY_ICME_EVENTS = False 
-
-PLOT_OVERVIEW = True
-PLOT_HELIOCENTRIC = True
-PLOT_EARTH_FRAME = True
-PLOT_INSITU_DST = True
-
-SAVE_PLOTS_TO_FILE = True 
-
-FIGURES_ROOT = '/Users/henryhodges/Documents/Year 4/Masters/Code/figures'
-
-PROPAGATION_METHOD = "both"  # "flat", "mvab", "both"
-MVAB_WINDOW_MINUTES = 30     # Time window for MVAB analysis
-MVAB_QUALITY_MIN = 3.0       # Minimum eigenvalue ratio (λ_max/λ_min)
-
-EVENT_LIMIT = {
-    "STEREO-A": 3,
-    "Solar Orbiter": 3,
-    "Parker Solar Probe": 3,
-    "STEREO-B": 3,
-}
-
-WRITE_EVENTS_CSV = True
-CSV_FILENAME = "henon_dro_crossover_events.csv"
-TRACK_CONTEXT_DAYS = 42
 
 # ------------------------------ Orbit model ------------------------------ #
 
@@ -2871,7 +3134,6 @@ class STEREODataLoader:
         return all_data
     
 # ------------------------------- Plotting -------------------------------- #
-# ------------------------------- Plotting -------------------------------- #
 
 class Plotter:
 
@@ -3014,7 +3276,8 @@ class Plotter:
         plt.tight_layout()
         
         if output_folder:
-            filepath = os.path.join(output_folder, "00_constellation_overview.png")
+            plot_folder = os.path.join(output_folder, "plots") if SAVE_DATA_CSV else output_folder
+            filepath = os.path.join(plot_folder, "00_constellation_overview.png")
             plt.savefig(filepath, dpi=300, bbox_inches='tight')
             print(f"  Saved: {filepath}")
             plt.close(fig)
@@ -3139,9 +3402,10 @@ class Plotter:
         plt.tight_layout()
         
         if output_folder:
+            plot_folder = os.path.join(output_folder, "plots") if SAVE_DATA_CSV else output_folder
             safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
             filename = f"helio_{safe_sc_name}_{event['time'].strftime('%Y%m%d')}.png"
-            filepath = os.path.join(output_folder, filename)
+            filepath = os.path.join(plot_folder, filename)
             plt.savefig(filepath, dpi=300, bbox_inches='tight')
             print(f"  Saved: {filepath}")
             plt.close(fig)
@@ -3174,14 +3438,18 @@ class Plotter:
         if any(mask):
             sc_e = []
             for t, pxyz in zip(np.array(times)[mask], pos_helio[mask]):
-                days = (t - epoch_date).total_seconds() / 86400
-                theta = MEAN_MOTION * days
-                epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
-                rel = pxyz - epos
+                epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)  # Earth heliocentric (km)
+                rel = pxyz - epos  # Earth-centered translation (km)
+
+                # Compute rotation from the *actual* Sun direction seen from Earth at time t
+                sun_rel = -epos  # vector Earth -> Sun in Earth-centered coords
+                theta = np.arctan2(sun_rel[1], sun_rel[0])  # angle of Sun direction in XY plane
+
                 c, s = np.cos(-theta), np.sin(-theta)
                 x_e = rel[0] * c - rel[1] * s
                 y_e = rel[0] * s + rel[1] * c
                 sc_e.append([x_e, y_e])
+
             sc_e = np.array(sc_e) / AU_KM
             ax.plot(sc_e[:, 0], sc_e[:, 1], "-", lw=2, color="#45B7D1", alpha=0.9, label=f"{spacecraft_name} (±{half:.0f} d)")
             radii.extend(np.linalg.norm(sc_e, axis=1).tolist())
@@ -3193,12 +3461,14 @@ class Plotter:
         ax.plot(dro_orbit_earth[:, 0], dro_orbit_earth[:, 1], "r-", lw=2, alpha=0.7, label=f"DRO-{event['dro_id']} ({dro_sat['rotation_deg']}°)")
         radii.extend(np.linalg.norm(dro_orbit_earth, axis=1).tolist())
 
-        days_ev = (event["time"] - epoch_date).total_seconds() / 86400
-        theta_ev = MEAN_MOTION * days_ev
-
         sc_h = event["spacecraft_pos"]
-        e_h = event["earth_pos"]
+        e_h  = event["earth_pos"]
+
         rel_ev = sc_h - e_h
+
+        sun_rel_ev = -e_h
+        theta_ev = np.arctan2(sun_rel_ev[1], sun_rel_ev[0])
+
         c_ev, s_ev = np.cos(-theta_ev), np.sin(-theta_ev)
         sc_x_e = rel_ev[0] * c_ev - rel_ev[1] * s_ev
         sc_y_e = rel_ev[0] * s_ev + rel_ev[1] * c_ev
@@ -3229,9 +3499,152 @@ class Plotter:
         plt.tight_layout()
         
         if output_folder:
+            plot_folder = os.path.join(output_folder, "plots") if SAVE_DATA_CSV else output_folder
             safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
             filename = f"earth_{safe_sc_name}_{event['time'].strftime('%Y%m%d')}.png"
-            filepath = os.path.join(output_folder, filename)
+            filepath = os.path.join(plot_folder, filename)
+            plt.savefig(filepath, dpi=300, bbox_inches='tight')
+            print(f"  Saved: {filepath}")
+            plt.close(fig)
+        
+        return fig
+
+    @staticmethod
+    def plot_all_icme_orbits_earth_frame(all_icme_events, constellation, spacecraft_data_dict, epoch_date, context_days=TRACK_CONTEXT_DAYS, output_folder=None):
+        """
+        Plot all ICME event orbits on a single Earth-centered plot.
+        
+        Args:
+            all_icme_events: Dictionary {spacecraft: [events]} containing only ICME events
+            constellation: DRO constellation
+            spacecraft_data_dict: Dictionary {spacecraft: ephemeris_data}
+            epoch_date: Epoch datetime
+            context_days: Days before/after event to plot
+            output_folder: Output folder path
+        """
+        fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+        ax.set_aspect("equal")
+        
+        # Plot Earth at origin
+        ax.plot(0, 0, "o", ms=12, color="#4A90E2", mec="white", mew=1.5, label="Earth", zorder=10)
+        
+        # Plot DRO orbit (use first DRO as reference)
+        dro_1 = constellation.satellites[0]
+        dro_orbit_earth = dro_1["orbit"]["dro_earth"] / AU_KM
+        ax.plot(dro_orbit_earth[:, 0], dro_orbit_earth[:, 1], "r-", lw=2, alpha=0.7, label="DRO")
+        
+        # Colors for different spacecraft
+        sc_colors = {
+            "Solar Orbiter": "#45B7D1",
+            "STEREO-A": "#FF6B6B",
+            "STEREO-B": "#9B59B6"
+        }
+        
+        radii = []
+        plotted_sc = set()
+        
+        half = context_days / 2.0
+        
+        # Plot each ICME event's orbit
+        for sc_name, events in all_icme_events.items():
+            if not events or sc_name not in spacecraft_data_dict:
+                continue
+            
+            color = sc_colors.get(sc_name, "#888888")
+            spacecraft_data = spacecraft_data_dict[sc_name]
+            
+            for event in events:
+                t_ev = event["time"]
+                t0 = t_ev - timedelta(days=half)
+                t1 = t_ev + timedelta(days=half)
+                
+                times = spacecraft_data["times"]
+                pos_helio = spacecraft_data["positions"]
+                mask = [(t0 <= t <= t1) for t in times]
+                
+                if not any(mask):
+                    continue
+                
+                # Transform to Earth frame (same logic as individual plots)
+                sc_e = []
+                for t, pxyz in zip(np.array(times)[mask], pos_helio[mask]):
+                    epos = SunEarthLineAnalyzer.earth_position_at_time(t, epoch_date)
+                    rel = pxyz - epos
+                    
+                    # Rotation to align Sun-Earth line
+                    sun_rel = -epos
+                    theta = np.arctan2(sun_rel[1], sun_rel[0])
+                    c, s = np.cos(-theta), np.sin(-theta)
+                    x_e = rel[0] * c - rel[1] * s
+                    y_e = rel[0] * s + rel[1] * c
+                    sc_e.append([x_e, y_e])
+                
+                sc_e = np.array(sc_e) / AU_KM
+                
+                # Plot orbit trajectory
+                label = sc_name if sc_name not in plotted_sc else None
+                plotted_sc.add(sc_name)
+                ax.plot(sc_e[:, 0], sc_e[:, 1], "-", lw=1.5, color=color, alpha=0.6, label=label)
+                
+                # Plot event position marker
+                sc_h = event["spacecraft_pos"]
+                e_h = event["earth_pos"]
+                rel_ev = sc_h - e_h
+                sun_rel_ev = -e_h
+                theta_ev = np.arctan2(sun_rel_ev[1], sun_rel_ev[0])
+                c_ev, s_ev = np.cos(-theta_ev), np.sin(-theta_ev)
+                sc_x_e = rel_ev[0] * c_ev - rel_ev[1] * s_ev
+                sc_y_e = rel_ev[0] * s_ev + rel_ev[1] * c_ev
+                sc_e_pt = np.array([sc_x_e, sc_y_e]) / AU_KM
+                
+                ax.plot(sc_e_pt[0], sc_e_pt[1], "o", ms=6, color=color, mec="white", mew=1, alpha=0.8)
+                
+                radii.extend(np.linalg.norm(sc_e, axis=1).tolist())
+        
+        # Plot L1
+        ax.plot(-0.01, 0.0, "D", ms=8, color="lime", mec="darkgreen", mew=1.5, label="L1", zorder=5)
+        
+        # Plot Sun (use first event as reference for position)
+        first_event = None
+        for events in all_icme_events.values():
+            if events:
+                first_event = events[0]
+                break
+        
+        if first_event:
+            e_h = first_event["earth_pos"]
+            sun_rel = -e_h
+            theta_ev = np.arctan2(sun_rel[1], sun_rel[0])
+            c_ev, s_ev = np.cos(-theta_ev), np.sin(-theta_ev)
+            sun_x_e = sun_rel[0] * c_ev - sun_rel[1] * s_ev
+            sun_y_e = sun_rel[0] * s_ev + sun_rel[1] * c_ev
+            sun_e = np.array([sun_x_e, sun_y_e]) / AU_KM
+            
+            ax.plot(sun_e[0], sun_e[1], "o", ms=14, color="#FDB813", mec="#F37021", mew=2, label="Sun", zorder=9)
+            ax.plot([0, sun_e[0]], [0, sun_e[1]], "g--", lw=1.5, alpha=0.5, label="Sun–Earth line")
+            radii.append(np.linalg.norm(sun_e))
+        
+        radii.extend(np.linalg.norm(dro_orbit_earth, axis=1).tolist())
+        
+        # Set axis limits
+        rmax = max(radii) if radii else 1.2
+        span = rmax + 0.10 * rmax
+        
+        ax.set_xlim(-span, span)
+        ax.set_ylim(-span, span)
+        ax.set_xlabel("X [AU] (Earth Frame)", fontsize=12)
+        ax.set_ylabel("Y [AU] (Earth Frame)", fontsize=12)
+        
+        # Count total ICME events
+        total_icme = sum(len(events) for events in all_icme_events.values())
+        ax.set_title(f"All ICME Events — Earth-Centered Frame\n{total_icme} ICME events (±{half:.0f} days)", fontsize=13)
+        ax.legend(loc="best", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if output_folder:
+            plot_folder = os.path.join(output_folder, "plots") if SAVE_DATA_CSV else output_folder
+            filepath = os.path.join(plot_folder, "00_all_icme_orbits_earth_frame.png")
             plt.savefig(filepath, dpi=300, bbox_inches='tight')
             print(f"  Saved: {filepath}")
             plt.close(fig)
@@ -3771,18 +4184,19 @@ class Plotter:
         plt.tight_layout()
 
         # Save figures
+
         if output_folder:
             safe_sc_name = spacecraft_name.replace(" ", "_").replace("-", "")
             timestamp = center.strftime('%Y%m%d')
             
             filepath1 = os.path.join(output_folder, f"insitu_{safe_sc_name}_{timestamp}.png")
             fig1.savefig(filepath1, dpi=300, bbox_inches='tight')
-            print(f"  Saved: {filepath1}")
+            print(f" Saved: {filepath1}")
             plt.close(fig1)
             
             filepath2 = os.path.join(output_folder, f"context_{safe_sc_name}_{timestamp}.png")
             fig2.savefig(filepath2, dpi=300, bbox_inches='tight')
-            print(f"  Saved: {filepath2}")
+            print(f" Saved: {filepath2}")
             plt.close(fig2)
 
         return fig1, fig2
@@ -3956,8 +4370,11 @@ def main():
                 t_ev = e["time"]
                 data = preloaded_data[sc].get(t_ev)
                 
-                # Check if this event has ICME matches
-                if data and data.get("icmes") is not None:
+                # Check if this event has ICME matches (check BOTH ballistic and MVAB)
+                has_ballistic = data and data.get("icmes_ballistic") is not None
+                has_mvab = data and data.get("icmes_mvab") is not None
+                
+                if has_ballistic or has_mvab:
                     icme_filtered.append(e)
             
             events_to_plot[sc] = icme_filtered
@@ -3965,8 +4382,23 @@ def main():
         
         total_events = sum(len(v) for v in events_to_plot.values())
         print(f"\n{'='*80}")
-        print(f"TOTAL EVENTS WITH ICMEs FOR PLOTTING: {total_events}")
+        print(f"TOTAL EVENTS FOR PLOTTING: {total_events}")
         print(f"{'='*80}\n")
+    
+    # ========================================================================
+    # PLOT COMBINED ICME ORBITS (if ICME filter is enabled)
+    # ========================================================================
+    
+    if PLOT_ONLY_ICME_EVENTS and any(len(v) > 0 for v in events_to_plot.values()):
+        print("\nPlotting: combined ICME orbits (Earth-centered)...")
+        Plotter.plot_all_icme_orbits_earth_frame(
+            events_to_plot, 
+            constellation, 
+            spacecraft_data, 
+            START_DATE,
+            context_days=TRACK_CONTEXT_DAYS,
+            output_folder=output_folder
+        )
         
     else:
         print(f"\n{'='*80}")
@@ -4022,13 +4454,20 @@ def main():
         if events_to_plot.get("Solar Orbiter") and preloaded_data.get("Solar Orbiter"):
             for e in events_to_plot["Solar Orbiter"]:
                 print(f"  Plotting Solar Orbiter @ {e['time'].strftime('%Y-%m-%d')}")
+                
+                # Save CSV if enabled
+                if SAVE_DATA_CSV and output_folder:
+                    write_event_csv(e, preloaded_data["Solar Orbiter"], 
+                                  spacecraft_data["Solar Orbiter"], START_DATE,
+                                  "Solar Orbiter", output_folder)
+                
                 fig = Plotter.plot_solo_insitu_with_dst(
                     e, 
                     preloaded_data["Solar Orbiter"],
                     spacecraft_data["Solar Orbiter"],
                     START_DATE,
                     spacecraft_name="Solar Orbiter",
-                    output_folder=output_folder
+                    output_folder=output_folder if not SAVE_DATA_CSV else os.path.join(output_folder, "plots")
                 )
                 if fig is None:
                     print(f"⚠️  Could not create plot for {e['time']}")
@@ -4037,13 +4476,20 @@ def main():
         if events_to_plot.get("STEREO-A") and preloaded_data.get("STEREO-A"):
             for e in events_to_plot["STEREO-A"]:
                 print(f"  Plotting STEREO-A @ {e['time'].strftime('%Y-%m-%d')}")
+                
+                # Save CSV if enabled
+                if SAVE_DATA_CSV and output_folder:
+                    write_event_csv(e, preloaded_data["STEREO-A"], 
+                                  spacecraft_data["STEREO-A"], START_DATE,
+                                  "STEREO-A", output_folder)
+                
                 fig = Plotter.plot_solo_insitu_with_dst(
                     e, 
                     preloaded_data["STEREO-A"],
                     spacecraft_data["STEREO-A"],
                     START_DATE,
                     spacecraft_name="STEREO-A",
-                    output_folder=output_folder
+                    output_folder=output_folder if not SAVE_DATA_CSV else os.path.join(output_folder, "plots")
                 )
                 if fig is None:
                     print(f"⚠️  Could not create plot for {e['time']}")
@@ -4052,13 +4498,20 @@ def main():
         if events_to_plot.get("STEREO-B") and preloaded_data.get("STEREO-B"):
             for e in events_to_plot["STEREO-B"]:
                 print(f"  Plotting STEREO-B @ {e['time'].strftime('%Y-%m-%d')}")
+                
+                # Save CSV if enabled
+                if SAVE_DATA_CSV and output_folder:
+                    write_event_csv(e, preloaded_data["STEREO-B"], 
+                                  spacecraft_data["STEREO-B"], START_DATE,
+                                  "STEREO-B", output_folder)
+                
                 fig = Plotter.plot_solo_insitu_with_dst(
                     e, 
                     preloaded_data["STEREO-B"],
                     spacecraft_data["STEREO-B"],
                     START_DATE,
                     spacecraft_name="STEREO-B",
-                    output_folder=output_folder
+                    output_folder=output_folder if not SAVE_DATA_CSV else os.path.join(output_folder, "plots")
                 )
                 if fig is None:
                     print(f"⚠️  Could not create plot for {e['time']}")
