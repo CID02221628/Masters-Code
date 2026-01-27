@@ -65,10 +65,10 @@ MVAB_WINDOW_MINUTES = 30     # Time window for MVAB analysis
 MVAB_QUALITY_MIN = 3.0       # Minimum eigenvalue ratio (λ_max/λ_min)
 
 EVENT_LIMIT = {
-    "STEREO-A": None,
-    "Solar Orbiter": None,
-    "Parker Solar Probe": None,
-    "STEREO-B": None,
+    "STEREO-A": 0,
+    "Solar Orbiter": 0,
+    "Parker Solar Probe": 0,
+    "STEREO-B": 7,
 }
 
 WRITE_EVENTS_CSV = True
@@ -179,15 +179,6 @@ def write_event_csv(event, preloaded_data, spacecraft_ephemeris, epoch_date,
                    spacecraft_name, output_folder, window_hours=INSITU_WINDOW_HR):
     """
     Write event data to CSV file.
-    
-    Args:
-        event: Crossover event dictionary
-        preloaded_data: Dictionary containing all preloaded data for this spacecraft
-        spacecraft_ephemeris: Spacecraft ephemeris data
-        epoch_date: Epoch datetime (START_DATE)
-        spacecraft_name: Name of spacecraft
-        output_folder: Base output folder
-        window_hours: Time window in hours
     """
     if not SAVE_DATA_CSV or not output_folder:
         return
@@ -205,7 +196,8 @@ def write_event_csv(event, preloaded_data, spacecraft_ephemeris, epoch_date,
     swa_moments = d.get("swa_moments")
     dst_shifted = d.get("dst_shifted")
     kp_shifted = d.get("kp_shifted")
-    l1_shifted = d.get("l1_shifted")
+    l1_shifted_ballistic = d.get("l1_shifted_ballistic")
+    l1_shifted_mvab = d.get("l1_shifted_mvab")
     
     if not mag or "time" not in mag or "B" not in mag:
         return
@@ -280,71 +272,169 @@ def write_event_csv(event, preloaded_data, spacecraft_ephemeris, epoch_date,
         for col in ['swa_n', 'swa_V_r', 'swa_V_t', 'swa_V_n', 'swa_V_mag', 'swa_T']:
             csv_data[col] = np.full(len(t_mag), np.nan)
     
-    # L1 data (ballistic propagation) - interpolate to MAG times
-    if l1_shifted and "B_gse_shifted" in l1_shifted:
-        l1_times = ensure_datetime_array(l1_shifted["time"])
+# ====================================================================
+    # L1 DATA - BALLISTIC PROPAGATION
+    # ====================================================================
+    if l1_shifted_ballistic and "B_gse_shifted" in l1_shifted_ballistic:
+        l1_times = ensure_datetime_array(l1_shifted_ballistic["time"])
         l1_times_sec = np.array([t.timestamp() for t in l1_times])
         
         # Magnetic field
-        b_l1 = l1_shifted["B_gse_shifted"]
+        b_l1 = l1_shifted_ballistic["B_gse_shifted"]
         if b_l1.ndim > 1 and b_l1.shape[1] == 3:
-            for i, comp in enumerate(['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse']):
+            for i, comp in enumerate(['l1_B_x_gse_ballistic', 'l1_B_y_gse_ballistic', 'l1_B_z_gse_ballistic']):
                 f_b = interp1d(l1_times_sec, b_l1[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
                 csv_data[comp] = f_b(mag_times_sec)
-            csv_data['l1_B_mag'] = np.sqrt(csv_data['l1_B_x_gse']**2 + csv_data['l1_B_y_gse']**2 + csv_data['l1_B_z_gse']**2)
+            csv_data['l1_B_mag_ballistic'] = np.sqrt(
+                csv_data['l1_B_x_gse_ballistic']**2 + 
+                csv_data['l1_B_y_gse_ballistic']**2 + 
+                csv_data['l1_B_z_gse_ballistic']**2
+            )
         else:
-            for comp in ['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse', 'l1_B_mag']:
+            for comp in ['l1_B_x_gse_ballistic', 'l1_B_y_gse_ballistic', 'l1_B_z_gse_ballistic', 'l1_B_mag_ballistic']:
                 csv_data[comp] = np.full(len(t_mag), np.nan)
         
         # Velocity
-        if "V_shifted" in l1_shifted:
-            v_l1 = l1_shifted["V_shifted"]
+        if "V_shifted" in l1_shifted_ballistic:
+            v_l1 = l1_shifted_ballistic["V_shifted"]
             if v_l1.ndim > 1 and v_l1.shape[1] == 3:
-                for i, comp in enumerate(['l1_V_x', 'l1_V_y', 'l1_V_z']):
+                for i, comp in enumerate(['l1_V_x_ballistic', 'l1_V_y_ballistic', 'l1_V_z_ballistic']):
                     f_v = interp1d(l1_times_sec, v_l1[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
                     csv_data[comp] = f_v(mag_times_sec)
-                csv_data['l1_V_mag'] = np.sqrt(csv_data['l1_V_x']**2 + csv_data['l1_V_y']**2 + csv_data['l1_V_z']**2)
+                csv_data['l1_V_mag_ballistic'] = np.sqrt(
+                    csv_data['l1_V_x_ballistic']**2 + 
+                    csv_data['l1_V_y_ballistic']**2 + 
+                    csv_data['l1_V_z_ballistic']**2
+                )
             else:
-                for comp in ['l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag']:
+                for comp in ['l1_V_x_ballistic', 'l1_V_y_ballistic', 'l1_V_z_ballistic', 'l1_V_mag_ballistic']:
                     csv_data[comp] = np.full(len(t_mag), np.nan)
         else:
-            for comp in ['l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag']:
+            for comp in ['l1_V_x_ballistic', 'l1_V_y_ballistic', 'l1_V_z_ballistic', 'l1_V_mag_ballistic']:
                 csv_data[comp] = np.full(len(t_mag), np.nan)
         
         # Density
-        if "n_shifted" in l1_shifted:
-            n_l1 = l1_shifted["n_shifted"]
+        if "n_shifted" in l1_shifted_ballistic:
+            n_l1 = l1_shifted_ballistic["n_shifted"]
             f_n = interp1d(l1_times_sec, n_l1, kind='linear', bounds_error=False, fill_value=np.nan)
-            csv_data['l1_n'] = f_n(mag_times_sec)
+            csv_data['l1_n_ballistic'] = f_n(mag_times_sec)
         else:
-            csv_data['l1_n'] = np.full(len(t_mag), np.nan)
+            csv_data['l1_n_ballistic'] = np.full(len(t_mag), np.nan)
         
         # Temperature
-        if "T_shifted" in l1_shifted:
-            t_l1 = l1_shifted["T_shifted"]
+        if "T_shifted" in l1_shifted_ballistic:
+            t_l1 = l1_shifted_ballistic["T_shifted"]
             f_t = interp1d(l1_times_sec, t_l1, kind='linear', bounds_error=False, fill_value=np.nan)
-            csv_data['l1_T'] = f_t(mag_times_sec)
+            csv_data['l1_T_ballistic'] = f_t(mag_times_sec)
         else:
-            csv_data['l1_T'] = np.full(len(t_mag), np.nan)
+            csv_data['l1_T_ballistic'] = np.full(len(t_mag), np.nan)
         
         # Propagation delay and distance
-        if "propagation_delay_hours" in l1_shifted:
-            delay = l1_shifted["propagation_delay_hours"]
+        if "propagation_delay_hours" in l1_shifted_ballistic:
+            delay = l1_shifted_ballistic["propagation_delay_hours"]
             f_delay = interp1d(l1_times_sec, delay, kind='linear', bounds_error=False, fill_value=np.nan)
-            csv_data['l1_propagation_delay_hours'] = f_delay(mag_times_sec)
+            csv_data['l1_propagation_delay_hours_ballistic'] = f_delay(mag_times_sec)
         else:
-            csv_data['l1_propagation_delay_hours'] = np.full(len(t_mag), np.nan)
+            csv_data['l1_propagation_delay_hours_ballistic'] = np.full(len(t_mag), np.nan)
         
-        if "propagation_distance_au" in l1_shifted:
-            dist = l1_shifted["propagation_distance_au"]
+        if "propagation_distance_au" in l1_shifted_ballistic:
+            dist = l1_shifted_ballistic["propagation_distance_au"]
             f_dist = interp1d(l1_times_sec, dist, kind='linear', bounds_error=False, fill_value=np.nan)
-            csv_data['l1_propagation_distance_au'] = f_dist(mag_times_sec)
+            csv_data['l1_propagation_distance_au_ballistic'] = f_dist(mag_times_sec)
         else:
-            csv_data['l1_propagation_distance_au'] = np.full(len(t_mag), np.nan)
+            csv_data['l1_propagation_distance_au_ballistic'] = np.full(len(t_mag), np.nan)
     else:
-        for col in ['l1_B_x_gse', 'l1_B_y_gse', 'l1_B_z_gse', 'l1_B_mag',
-                    'l1_V_x', 'l1_V_y', 'l1_V_z', 'l1_V_mag',
-                    'l1_n', 'l1_T', 'l1_propagation_delay_hours', 'l1_propagation_distance_au']:
+        for col in ['l1_B_x_gse_ballistic', 'l1_B_y_gse_ballistic', 'l1_B_z_gse_ballistic', 'l1_B_mag_ballistic',
+                    'l1_V_x_ballistic', 'l1_V_y_ballistic', 'l1_V_z_ballistic', 'l1_V_mag_ballistic',
+                    'l1_n_ballistic', 'l1_T_ballistic', 
+                    'l1_propagation_delay_hours_ballistic', 'l1_propagation_distance_au_ballistic']:
+            csv_data[col] = np.full(len(t_mag), np.nan)
+    
+    # ====================================================================
+    # L1 DATA - MVAB PROPAGATION
+    # ====================================================================
+    if l1_shifted_mvab and "B_gse_shifted" in l1_shifted_mvab:
+        l1_times_mvab = ensure_datetime_array(l1_shifted_mvab["time"])
+        l1_times_mvab_sec = np.array([t.timestamp() for t in l1_times_mvab])
+        
+        # Magnetic field
+        b_l1_mvab = l1_shifted_mvab["B_gse_shifted"]
+        if b_l1_mvab.ndim > 1 and b_l1_mvab.shape[1] == 3:
+            for i, comp in enumerate(['l1_B_x_gse_mvab', 'l1_B_y_gse_mvab', 'l1_B_z_gse_mvab']):
+                f_b = interp1d(l1_times_mvab_sec, b_l1_mvab[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+                csv_data[comp] = f_b(mag_times_sec)
+            csv_data['l1_B_mag_mvab'] = np.sqrt(
+                csv_data['l1_B_x_gse_mvab']**2 + 
+                csv_data['l1_B_y_gse_mvab']**2 + 
+                csv_data['l1_B_z_gse_mvab']**2
+            )
+        else:
+            for comp in ['l1_B_x_gse_mvab', 'l1_B_y_gse_mvab', 'l1_B_z_gse_mvab', 'l1_B_mag_mvab']:
+                csv_data[comp] = np.full(len(t_mag), np.nan)
+        
+        # Velocity
+        if "V_shifted" in l1_shifted_mvab:
+            v_l1_mvab = l1_shifted_mvab["V_shifted"]
+            if v_l1_mvab.ndim > 1 and v_l1_mvab.shape[1] == 3:
+                for i, comp in enumerate(['l1_V_x_mvab', 'l1_V_y_mvab', 'l1_V_z_mvab']):
+                    f_v = interp1d(l1_times_mvab_sec, v_l1_mvab[:, i], kind='linear', bounds_error=False, fill_value=np.nan)
+                    csv_data[comp] = f_v(mag_times_sec)
+                csv_data['l1_V_mag_mvab'] = np.sqrt(
+                    csv_data['l1_V_x_mvab']**2 + 
+                    csv_data['l1_V_y_mvab']**2 + 
+                    csv_data['l1_V_z_mvab']**2
+                )
+            else:
+                for comp in ['l1_V_x_mvab', 'l1_V_y_mvab', 'l1_V_z_mvab', 'l1_V_mag_mvab']:
+                    csv_data[comp] = np.full(len(t_mag), np.nan)
+        else:
+            for comp in ['l1_V_x_mvab', 'l1_V_y_mvab', 'l1_V_z_mvab', 'l1_V_mag_mvab']:
+                csv_data[comp] = np.full(len(t_mag), np.nan)
+        
+        # Density
+        if "n_shifted" in l1_shifted_mvab:
+            n_l1_mvab = l1_shifted_mvab["n_shifted"]
+            f_n = interp1d(l1_times_mvab_sec, n_l1_mvab, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_n_mvab'] = f_n(mag_times_sec)
+        else:
+            csv_data['l1_n_mvab'] = np.full(len(t_mag), np.nan)
+        
+        # Temperature
+        if "T_shifted" in l1_shifted_mvab:
+            t_l1_mvab = l1_shifted_mvab["T_shifted"]
+            f_t = interp1d(l1_times_mvab_sec, t_l1_mvab, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_T_mvab'] = f_t(mag_times_sec)
+        else:
+            csv_data['l1_T_mvab'] = np.full(len(t_mag), np.nan)
+        
+        # Propagation delay and distance
+        if "propagation_delay_hours" in l1_shifted_mvab:
+            delay_mvab = l1_shifted_mvab["propagation_delay_hours"]
+            f_delay = interp1d(l1_times_mvab_sec, delay_mvab, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_propagation_delay_hours_mvab'] = f_delay(mag_times_sec)
+        else:
+            csv_data['l1_propagation_delay_hours_mvab'] = np.full(len(t_mag), np.nan)
+        
+        if "propagation_distance_au" in l1_shifted_mvab:
+            dist_mvab = l1_shifted_mvab["propagation_distance_au"]
+            f_dist = interp1d(l1_times_mvab_sec, dist_mvab, kind='linear', bounds_error=False, fill_value=np.nan)
+            csv_data['l1_propagation_distance_au_mvab'] = f_dist(mag_times_sec)
+        else:
+            csv_data['l1_propagation_distance_au_mvab'] = np.full(len(t_mag), np.nan)
+        
+        # MVAB quality metrics
+        if "mvab_qualities" in l1_shifted_mvab:
+            qualities = l1_shifted_mvab["mvab_qualities"]
+            f_qual = interp1d(l1_times_mvab_sec, qualities, kind='nearest', bounds_error=False, fill_value=np.nan)
+            csv_data['mvab_quality'] = f_qual(mag_times_sec)
+        else:
+            csv_data['mvab_quality'] = np.full(len(t_mag), np.nan)
+    else:
+        for col in ['l1_B_x_gse_mvab', 'l1_B_y_gse_mvab', 'l1_B_z_gse_mvab', 'l1_B_mag_mvab',
+                    'l1_V_x_mvab', 'l1_V_y_mvab', 'l1_V_z_mvab', 'l1_V_mag_mvab',
+                    'l1_n_mvab', 'l1_T_mvab',
+                    'l1_propagation_delay_hours_mvab', 'l1_propagation_distance_au_mvab',
+                    'mvab_quality']:
             csv_data[col] = np.full(len(t_mag), np.nan)
     
     # Geomagnetic indices (ballistic shifted)
@@ -406,7 +496,8 @@ def write_event_csv(event, preloaded_data, spacecraft_ephemeris, epoch_date,
     # Data quality flags
     csv_data['mag_data_available'] = 1
     csv_data['swa_data_available'] = 1 if (swa_moments and "n" in swa_moments) else 0
-    csv_data['l1_data_available'] = 1 if (l1_shifted and "B_gse_shifted" in l1_shifted) else 0
+    csv_data['l1_ballistic_available'] = 1 if (l1_shifted_ballistic and "B_gse_shifted" in l1_shifted_ballistic) else 0
+    csv_data['l1_mvab_available'] = 1 if (l1_shifted_mvab and "B_gse_shifted" in l1_shifted_mvab) else 0
     csv_data['dst_data_available'] = 1 if (dst_shifted and "dst_shifted" in dst_shifted) else 0
     csv_data['kp_data_available'] = 1 if (kp_shifted and "kp_shifted" in kp_shifted) else 0
     
@@ -3087,11 +3178,30 @@ class STEREODataLoader:
                     )
                     
                     if l1:
-                        l1_shifted = BallisticPropagation.apply_ballistic_shift_to_l1(
-                            common, l1, spacecraft_ephemeris, epoch_date
-                        )
+                        # Ballistic propagation (always compute if needed)
+                        if PROPAGATION_METHOD in ["flat", "both"]:
+                            l1_shifted_ballistic = BallisticPropagation.apply_ballistic_shift_to_l1(
+                                common, l1, spacecraft_ephemeris, epoch_date
+                            )
+                        
+                        # MVAB propagation (compute if requested)
+                        if PROPAGATION_METHOD in ["mvab", "both"]:
+                            l1_shifted_mvab = MVABPropagation.apply_mvab_shift_to_l1(
+                                common, l1, spacecraft_ephemeris, epoch_date,
+                                window_minutes=MVAB_WINDOW_MINUTES,
+                                quality_threshold=MVAB_QUALITY_MIN
+                            )
+                            if l1_shifted_mvab is None:
+                                print("    ⚠️  MVAB L1 propagation failed for this event")
+                        
+                        # Decide which to use as primary L1 shifted data
+                        if PROPAGATION_METHOD == "flat":
+                            l1_shifted = l1_shifted_ballistic
+                        elif PROPAGATION_METHOD == "mvab":
+                            l1_shifted = l1_shifted_mvab if l1_shifted_mvab else l1_shifted_ballistic
+                        else:  # "both"
+                            l1_shifted = l1_shifted_ballistic  # Use ballistic as primary
             
-            # Back-propagate ICMEs
             # Back-propagate ICMEs based on propagation method
             icmes_ballistic = None
             icmes_mvab = None
@@ -3111,9 +3221,22 @@ class STEREODataLoader:
                 else:
                     print(f"    ✗ Ballistic: No ICMEs matched")
                 
-                # MVAB for STEREO not yet implemented (no MVAB L1 shifting)
+                # MVAB ICME propagation (now possible with MVAB L1 data)
                 if PROPAGATION_METHOD in ["mvab", "both"]:
-                    print(f"    ⚠️  MVAB ICME propagation not implemented for STEREO (no MVAB L1 data)")
+                    print(f"[ICME] Computing MVAB propagation...")
+                    if l1_shifted_mvab:
+                        icmes_mvab = CME_Catalogue.backpropagate_icmes(
+                            event, spacecraft_ephemeris, epoch_date, icme_catalogue,
+                            common_data=common,
+                            use_mvab=True,
+                            mvab_data=l1_shifted_mvab
+                        )
+                        if icmes_mvab:
+                            print(f"    ✓ MVAB: Matched {len(icmes_mvab)} ICME(s)")
+                        else:
+                            print(f"    ✗ MVAB: No ICMEs matched")
+                    else:
+                        print(f"    ⚠️  MVAB: Cannot compute (no MVAB L1 data)")
 
             all_data[t_ev] = {
                 "mag": mag,
@@ -3127,7 +3250,9 @@ class STEREODataLoader:
                 "kp_shifted": kp_shifted,
                 "l1_data": l1,
                 "l1_shifted": l1_shifted,
-                "icmes_ballistic": icmes_ballistic,
+                "l1_shifted_mvab": l1_shifted_mvab,      # Store both methods
+                "l1_shifted_ballistic": l1_shifted_ballistic,
+                "icmes_ballistic": icmes_ballistic,       # Store both ICME results
                 "icmes_mvab": icmes_mvab,
             }
         
